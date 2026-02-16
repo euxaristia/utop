@@ -52,8 +52,8 @@ impl App {
     fn next_process(&mut self) {
         let i = match self.process_state.selected() {
             Some(i) => {
-                if i >= self.process_count - 1 {
-                    0
+                if i >= self.process_count.saturating_sub(1) {
+                    i
                 } else {
                     i + 1
                 }
@@ -67,7 +67,7 @@ impl App {
         let i = match self.process_state.selected() {
             Some(i) => {
                 if i == 0 {
-                    self.process_count - 1
+                    0
                 } else {
                     i - 1
                 }
@@ -212,6 +212,12 @@ fn ui(f: &mut Frame, app: &mut App) {
         Row::new(cells)
     });
 
+    let title = format!(
+        " Processes [{}/{}] ",
+        app.process_state.selected().map(|i| i + 1).unwrap_or(0),
+        app.process_count
+    );
+
     let t = Table::new(
         rows,
         [
@@ -222,7 +228,7 @@ fn ui(f: &mut Frame, app: &mut App) {
         ],
     )
     .header(header)
-    .block(Block::default().borders(Borders::ALL).title(" Processes "))
+    .block(Block::default().borders(Borders::ALL).title(title))
     .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED));
 
     f.render_stateful_widget(t, chunks[3], &mut app.process_state);
