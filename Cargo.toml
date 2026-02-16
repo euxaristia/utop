@@ -1,0 +1,11 @@
+[package]
+name = "rtop"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0"
+
+[dependencies]
+color-eyre = "0.6.5"
+crossterm = "0.29.0"
+ratatui = "0.30.0"
+sysinfo = "0.38.2"
