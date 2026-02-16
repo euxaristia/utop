@@ -2,7 +2,10 @@
 
 A balanced system monitor written in Rust, designed to fill the niche between the feature-richness of `btop` and the simplicity of `htop`.
 
-![License](https://img.shields.io/badge/license-GPLv3-blue.svg)
+[![GitHub Repository](https://img.shields.io/badge/GitHub-rtop-blue?logo=github)](https://github.com/euxaristia/rtop)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
+[![Built with Rust](https://img.shields.io/badge/Built%20with-Rust-orange?logo=rust)](https://www.rust-lang.org/)
+[![Platform](https://img.shields.io/badge/Platform-Linux-lightgrey?logo=linux)](https://github.com/euxaristia/rtop)
 
 ## Features
 
