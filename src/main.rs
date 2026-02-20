@@ -569,7 +569,7 @@ impl App {
                 },
                 ModalState::SignalPicker { mut selected } => match code {
                     KeyCode::Esc => {}
-                    KeyCode::Down | KeyCode::Char('j') => {
+                    KeyCode::Down => {
                         selected = (selected + 1).min(SIGNAL_OPTIONS.len() - 1);
                         self.modal = Some(ModalState::SignalPicker { selected });
                     }
@@ -641,8 +641,8 @@ where
                                     {
                                         return Ok(());
                                     }
-                                    KeyCode::Down | KeyCode::Char('j') => app.next_process(),
-                                    KeyCode::Up | KeyCode::Char('u') => app.previous_process(),
+                                    KeyCode::Down => app.next_process(),
+                                    KeyCode::Up => app.previous_process(),
                                     KeyCode::PageDown => app.page_down(page_size),
                                     KeyCode::PageUp => app.page_up(page_size),
                                     KeyCode::Home => app.jump_top(),
@@ -1069,7 +1069,7 @@ fn ui(f: &mut Frame, app: &mut App) {
     let footer_left = match app.input_mode {
         InputMode::Filter => " ↑↓ select  / search: ACTIVE  Esc/Enter done  x clear  q quit ",
         InputMode::Normal => {
-            " ↑/u↓/j select  / search: inactive  x clear  t term  k kill  s signals  ←/→ sort  r rev  e per-core  w tree  l lazy  q quit "
+            " ↑/↓ select  / search: inactive  x clear  t term  k kill  s signals  ←/→ sort  r rev  e per-core  w tree  l lazy  q quit "
         }
     };
     let current = if app.process_count() == 0 {
