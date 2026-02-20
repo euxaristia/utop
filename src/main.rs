@@ -47,6 +47,9 @@ struct ProcessRowData {
     pid: String,
     pid_num: u32,
     name: String,
+    command: String,
+    user: String,
+    threads: usize,
     cpu_total_percent: f32,
     mem_percent: f64,
     mem_bytes: u64,
@@ -121,6 +124,17 @@ impl App {
                 pid: p.pid().to_string(),
                 pid_num: p.pid().as_u32(),
                 name: p.name().to_string_lossy().into_owned(),
+                command: p
+                    .cmd()
+                    .iter()
+                    .map(|s| s.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                user: p
+                    .user_id()
+                    .map(|uid| uid.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                threads: p.tasks().map_or(1, |tasks| tasks.len().max(1)),
                 cpu_total_percent: (p.cpu_usage() / self.cpu_count as f32).clamp(0.0, 100.0),
                 mem_percent: (p.memory() as f64 / total_mem * 100.0).clamp(0.0, 100.0),
                 mem_bytes: p.memory(),
@@ -386,7 +400,7 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     let top_block = Block::default()
         .borders(Borders::ALL)
-        .title("1 cpu menu preset *")
+        .title("┌1 cpu┐┌menu┐┌preset *")
         .border_style(Style::default().fg(Color::DarkGray));
     f.render_widget(Clear, root[0]);
     f.render_widget(top_block.clone(), root[0]);
@@ -395,6 +409,21 @@ fn ui(f: &mut Frame, app: &mut App) {
     f.render_widget(
         Paragraph::new(format!("up {}h {}m", uptime / 3600, (uptime % 3600) / 60))
             .style(Style::default().fg(Color::Gray)),
+        top_inner,
+    );
+    f.render_widget(
+        Paragraph::new(format!(
+            "{:02}:{:02}:{:02}",
+            (uptime / 3600) % 24,
+            (uptime / 60) % 60,
+            uptime % 60
+        ))
+        .style(
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )
+        .centered(),
         top_inner,
     );
 
@@ -412,14 +441,15 @@ fn ui(f: &mut Frame, app: &mut App) {
     let mini_inner = mini_block.inner(mini);
     f.render_widget(mini_block, mini);
     let mut lines = vec![format!(
-        "CPU {:>5.1}%  ({} cores)",
-        cpu_usage, app.cpu_count
+        "CPU {:<18} {:>5.1}%",
+        bar(cpu_usage, 12),
+        cpu_usage
     )];
     for (i, u) in app.core_usages.iter().enumerate() {
-        lines.push(format!("C{:<2} {:>5.1}%", i, u));
+        lines.push(format!("C{:<2} {:<18} {:>5.1}%", i, bar(*u, 12), u));
     }
     lines.push(format!(
-        "Load AVG {:>4.2} {:>4.2} {:>4.2}",
+        "Load AVG: {:>4.2} {:>4.2} {:>4.2}",
         load.one, load.five, load.fifteen
     ));
     f.render_widget(
@@ -450,22 +480,25 @@ fn ui(f: &mut Frame, app: &mut App) {
     let used_swap = app.system.used_swap();
     let avail_mem = app.system.available_memory();
     let free_mem = app.system.free_memory();
+    let cached_mem = total_mem.saturating_sub(used_mem).saturating_sub(free_mem);
 
     f.render_widget(Clear, upper_left[0]);
     let mem_block = Block::default()
         .borders(Borders::ALL)
-        .title("Memory Pressure")
-        .border_style(Style::default().fg(Color::Blue));
+        .title("┌2 mem┐")
+        .border_style(Style::default().fg(Color::Red));
     let mem_inner = mem_block.inner(upper_left[0]);
     f.render_widget(mem_block, upper_left[0]);
     f.render_widget(
         Paragraph::new(format!(
-            "Total: {:>7.2} GiB\nUsed:  {:>7.2} GiB  {:>4.0}%\nAvail: {:>7.2} GiB  {:>4.0}%\nFree:  {:>7.2} GiB  {:>4.0}%",
+            "Total:{:>12.2} GiB\nUsed:{:>13.2} GiB\n{:>18.0}%\n\nAvailable:{:>8.2} GiB\n{:>18.0}%\n\nCached:{:>11.2} GiB\n{:>18.0}%\n\nFree:{:>13.2} GiB\n{:>18.0}%",
             gib(total_mem),
             gib(used_mem),
             pct(used_mem, total_mem),
             gib(avail_mem),
             pct(avail_mem, total_mem),
+            gib(cached_mem),
+            pct(cached_mem, total_mem),
             gib(free_mem),
             pct(free_mem, total_mem),
         ))
@@ -476,17 +509,21 @@ fn ui(f: &mut Frame, app: &mut App) {
     f.render_widget(Clear, upper_left[1]);
     let disks_block = Block::default()
         .borders(Borders::ALL)
-        .title("disks")
+        .title("┌disks┐")
         .border_style(Style::default().fg(Color::Yellow));
     let disks_inner = disks_block.inner(upper_left[1]);
     f.render_widget(disks_block, upper_left[1]);
     f.render_widget(
         Paragraph::new(format!(
-            "root\nUsed: {:>4.0}%\nFree: {:>4.0}%\nswap\nUsed: {:>4.0}%\nFree: {:>4.0}%",
+            "root\nUsed:{:>4.0}% {:<18}\nFree:{:>4.0}% {:<18}\n\nswap\nUsed:{:>4.0}% {:<18}\nFree:{:>4.0}% {:<18}",
             pct(used_mem, total_mem),
+            bar(pct(used_mem, total_mem) as f32, 12),
             100.0 - pct(used_mem, total_mem),
+            bar((100.0 - pct(used_mem, total_mem)) as f32, 12),
             pct(used_swap, total_swap),
+            bar(pct(used_swap, total_swap) as f32, 12),
             100.0 - pct(used_swap, total_swap),
+            bar((100.0 - pct(used_swap, total_swap)) as f32, 12),
         ))
         .style(Style::default().fg(Color::White)),
         disks_inner,
@@ -496,7 +533,7 @@ fn ui(f: &mut Frame, app: &mut App) {
     f.render_widget(
         Block::default()
             .borders(Borders::ALL)
-            .title("3 net")
+            .title("┌3 net┐")
             .border_style(Style::default().fg(Color::Blue)),
         lower_left[0],
     );
@@ -510,7 +547,7 @@ fn ui(f: &mut Frame, app: &mut App) {
     f.render_widget(sync_block, lower_left[1]);
     f.render_widget(
         Paragraph::new(format!(
-            "download\n0 B/s\n\nupload\n0 B/s\n\nfilter: {}",
+            "download\n0 Byte/s\nTop: 0 bps\nTotal: 0 B\n\nupload\n0 Byte/s\nTop: 0 bps\nTotal: 0 B\n\nfilter: {}",
             if app.filter_query.is_empty() {
                 "<none>".to_string()
             } else {
@@ -528,9 +565,11 @@ fn ui(f: &mut Frame, app: &mut App) {
     let end = (start + table_visible_rows).min(app.process_count());
 
     let header = Row::new(
-        ["Pid", "Program", "MemB", "Cpu%"]
-            .into_iter()
-            .map(Cell::from),
+        [
+            "Pid", "Program", "Command", "Threads", "User", "MemB", "Cpu%",
+        ]
+        .into_iter()
+        .map(Cell::from),
     )
     .style(
         Style::default()
@@ -553,6 +592,13 @@ fn ui(f: &mut Frame, app: &mut App) {
             Row::new(vec![
                 Cell::from(p.pid.clone()),
                 Cell::from(p.name.clone()),
+                Cell::from(if p.command.is_empty() {
+                    p.name.clone()
+                } else {
+                    p.command.clone()
+                }),
+                Cell::from(format!("{}", p.threads)),
+                Cell::from(p.user.clone()),
                 Cell::from(format!("{:>6}", human_bytes(p.mem_bytes))),
                 Cell::from(format!("{:>5.1}", p.cpu_total_percent)),
             ])
@@ -562,10 +608,13 @@ fn ui(f: &mut Frame, app: &mut App) {
     let table = Table::new(
         rows,
         [
-            Constraint::Percentage(18),
-            Constraint::Percentage(50),
+            Constraint::Percentage(10),
             Constraint::Percentage(16),
-            Constraint::Percentage(16),
+            Constraint::Percentage(38),
+            Constraint::Percentage(8),
+            Constraint::Percentage(12),
+            Constraint::Percentage(8),
+            Constraint::Percentage(8),
         ],
     )
     .header(header)
@@ -573,12 +622,16 @@ fn ui(f: &mut Frame, app: &mut App) {
         Block::default()
             .borders(Borders::ALL)
             .title(format!(
-                "4 proc filter per-core reverse tree < cpu Lazy > [{}]",
+                "┌4 proc┐filter {}┐per-core {}┐reverse {}┐tree┐< {} {} >",
                 if app.filter_query.is_empty() {
-                    "none".to_string()
+                    "<empty>".to_string()
                 } else {
                     app.filter_query.clone()
-                }
+                },
+                "on",
+                if app.sort_reverse { "on" } else { "off" },
+                sort_name(app.sort_mode),
+                "lazy"
             ))
             .border_style(Style::default().fg(Color::Red)),
     );
@@ -592,6 +645,24 @@ fn ui(f: &mut Frame, app: &mut App) {
         .style(Style::default().fg(Color::DarkGray)),
         root[2],
     );
+}
+
+fn sort_name(mode: SortMode) -> &'static str {
+    match mode {
+        SortMode::Cpu => "cpu",
+        SortMode::Mem => "mem",
+        SortMode::Pid => "pid",
+        SortMode::Name => "name",
+    }
+}
+
+fn bar(value: f32, width: usize) -> String {
+    let fill = ((value.clamp(0.0, 100.0) / 100.0) * width as f32).round() as usize;
+    let mut s = String::with_capacity(width);
+    for i in 0..width {
+        s.push(if i < fill { '█' } else { '·' });
+    }
+    s
 }
 
 fn gib(bytes: u64) -> f64 {
