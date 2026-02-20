@@ -50,6 +50,7 @@ struct ProcessRowData {
     pid: String,
     pid_num: u32,
     name: String,
+    name_lc: String,
     command: String,
     user: String,
     threads: usize,
@@ -88,6 +89,7 @@ struct App {
     net_rx_total: u64,
     net_tx_total: u64,
     last_disk_refresh: Instant,
+    last_process_refresh: Instant,
 }
 
 impl App {
@@ -117,6 +119,7 @@ impl App {
             net_rx_total: 0,
             net_tx_total: 0,
             last_disk_refresh: Instant::now(),
+            last_process_refresh: Instant::now(),
         };
         app.update();
         app
@@ -127,16 +130,23 @@ impl App {
         self.system
             .refresh_cpu_specifics(CpuRefreshKind::nothing().with_cpu_usage());
         self.system.refresh_memory();
-        self.system.refresh_processes_specifics(
-            ProcessesToUpdate::All,
-            true,
-            ProcessRefreshKind::nothing()
-                .with_cpu()
-                .with_memory()
-                .with_user(UpdateKind::OnlyIfNotSet)
-                .with_cmd(UpdateKind::OnlyIfNotSet)
-                .without_tasks(),
-        );
+        let mut process_refreshed = false;
+        if self.all_process_rows.is_empty()
+            || self.last_process_refresh.elapsed() >= Duration::from_millis(1500)
+        {
+            self.system.refresh_processes_specifics(
+                ProcessesToUpdate::All,
+                true,
+                ProcessRefreshKind::nothing()
+                    .with_cpu()
+                    .with_memory()
+                    .with_user(UpdateKind::OnlyIfNotSet)
+                    .with_cmd(UpdateKind::OnlyIfNotSet)
+                    .without_tasks(),
+            );
+            process_refreshed = true;
+            self.last_process_refresh = Instant::now();
+        }
         if self.last_disk_refresh.elapsed() >= Duration::from_secs(5) {
             self.disks.refresh(false);
             self.last_disk_refresh = Instant::now();
@@ -156,38 +166,46 @@ impl App {
             self.cpu_history.pop_front();
         }
 
-        let total_mem = self.system.total_memory().max(1) as f64;
-        self.all_process_rows = self
-            .system
-            .processes()
-            .values()
-            .map(|p| ProcessRowData {
-                pid: p.pid().to_string(),
-                pid_num: p.pid().as_u32(),
-                name: trim_text(&p.name().to_string_lossy(), 18),
-                command: p
-                    .cmd()
-                    .iter()
-                    .take(4)
-                    .map(|s| s.to_string_lossy().to_string())
-                    .collect::<Vec<_>>()
-                    .join(" "),
-                user: p
-                    .user_id()
-                    .map(|uid| uid.to_string())
-                    .unwrap_or_else(|| "-".to_string()),
-                threads: p.tasks().map_or(1, |tasks| tasks.len().max(1)),
-                cpu_total_percent: (p.cpu_usage() / self.cpu_count as f32).clamp(0.0, 100.0),
-                mem_percent: (p.memory() as f64 / total_mem * 100.0).clamp(0.0, 100.0),
-                mem_bytes: p.memory(),
-            })
-            .collect();
-        for row in &mut self.all_process_rows {
-            if row.command.is_empty() {
-                row.command = row.name.clone();
-            } else {
-                row.command = trim_text(&row.command, 54);
+        if process_refreshed {
+            let total_mem = self.system.total_memory().max(1) as f64;
+            self.all_process_rows = self
+                .system
+                .processes()
+                .values()
+                .map(|p| {
+                    let name = trim_text(&p.name().to_string_lossy(), 18);
+                    ProcessRowData {
+                        pid: p.pid().to_string(),
+                        pid_num: p.pid().as_u32(),
+                        name_lc: name.to_lowercase(),
+                        name,
+                        command: p
+                            .cmd()
+                            .iter()
+                            .take(4)
+                            .map(|s| s.to_string_lossy().to_string())
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                        user: p
+                            .user_id()
+                            .map(|uid| uid.to_string())
+                            .unwrap_or_else(|| "-".to_string()),
+                        threads: p.tasks().map_or(1, |tasks| tasks.len().max(1)),
+                        cpu_total_percent: (p.cpu_usage() / self.cpu_count as f32)
+                            .clamp(0.0, 100.0),
+                        mem_percent: (p.memory() as f64 / total_mem * 100.0).clamp(0.0, 100.0),
+                        mem_bytes: p.memory(),
+                    }
+                })
+                .collect();
+            for row in &mut self.all_process_rows {
+                if row.command.is_empty() {
+                    row.command = row.name.clone();
+                } else {
+                    row.command = trim_text(&row.command, 54);
+                }
             }
+            self.rebuild_process_rows();
         }
 
         let selected = self
@@ -205,8 +223,6 @@ impl App {
             self.net_rx_total = data.total_received();
             self.net_tx_total = data.total_transmitted();
         }
-
-        self.rebuild_process_rows();
     }
 
     fn rebuild_process_rows(&mut self) {
@@ -221,7 +237,7 @@ impl App {
             .iter()
             .filter(|row| {
                 query.is_empty()
-                    || row.name.to_lowercase().contains(&query)
+                    || row.name_lc.contains(&query)
                     || row.pid.contains(&self.filter_query)
             })
             .cloned()
@@ -409,35 +425,42 @@ where
             .unwrap_or_else(|| Duration::from_secs(0));
 
         if event::poll(timeout)? {
-            if let Event::Key(key) = event::read()? {
-                match app.input_mode {
-                    InputMode::Filter => app.handle_filter_key(key.code),
-                    InputMode::Normal => {
-                        let page_size = terminal.size()?.height.saturating_sub(14) as usize;
-                        match key.code {
-                            KeyCode::Char('q') => return Ok(()),
-                            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                return Ok(());
+            loop {
+                if let Event::Key(key) = event::read()? {
+                    match app.input_mode {
+                        InputMode::Filter => app.handle_filter_key(key.code),
+                        InputMode::Normal => {
+                            let page_size = terminal.size()?.height.saturating_sub(14) as usize;
+                            match key.code {
+                                KeyCode::Char('q') => return Ok(()),
+                                KeyCode::Char('c')
+                                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                {
+                                    return Ok(());
+                                }
+                                KeyCode::Down | KeyCode::Char('j') => app.next_process(),
+                                KeyCode::Up | KeyCode::Char('k') => app.previous_process(),
+                                KeyCode::PageDown => app.page_down(page_size),
+                                KeyCode::PageUp => app.page_up(page_size),
+                                KeyCode::Home => app.jump_top(),
+                                KeyCode::End => app.jump_bottom(),
+                                KeyCode::Char('/') => app.start_filter_input(),
+                                KeyCode::Char('x') => app.clear_filter(),
+                                KeyCode::Char('s') => app.cycle_sort_mode(),
+                                KeyCode::Char('r') => app.toggle_reverse(),
+                                KeyCode::Char('c') => app.set_sort_mode(SortMode::Cpu),
+                                KeyCode::Char('m') => app.set_sort_mode(SortMode::Mem),
+                                KeyCode::Char('p') => app.set_sort_mode(SortMode::Pid),
+                                KeyCode::Char('n') => app.set_sort_mode(SortMode::Name),
+                                KeyCode::Char('+') | KeyCode::Char('=') => app.speed_up_refresh(),
+                                KeyCode::Char('-') | KeyCode::Char('_') => app.slow_down_refresh(),
+                                _ => {}
                             }
-                            KeyCode::Down | KeyCode::Char('j') => app.next_process(),
-                            KeyCode::Up | KeyCode::Char('k') => app.previous_process(),
-                            KeyCode::PageDown => app.page_down(page_size),
-                            KeyCode::PageUp => app.page_up(page_size),
-                            KeyCode::Home => app.jump_top(),
-                            KeyCode::End => app.jump_bottom(),
-                            KeyCode::Char('/') => app.start_filter_input(),
-                            KeyCode::Char('x') => app.clear_filter(),
-                            KeyCode::Char('s') => app.cycle_sort_mode(),
-                            KeyCode::Char('r') => app.toggle_reverse(),
-                            KeyCode::Char('c') => app.set_sort_mode(SortMode::Cpu),
-                            KeyCode::Char('m') => app.set_sort_mode(SortMode::Mem),
-                            KeyCode::Char('p') => app.set_sort_mode(SortMode::Pid),
-                            KeyCode::Char('n') => app.set_sort_mode(SortMode::Name),
-                            KeyCode::Char('+') | KeyCode::Char('=') => app.speed_up_refresh(),
-                            KeyCode::Char('-') | KeyCode::Char('_') => app.slow_down_refresh(),
-                            _ => {}
                         }
                     }
+                }
+                if !event::poll(Duration::from_millis(0))? {
+                    break;
                 }
             }
         }
