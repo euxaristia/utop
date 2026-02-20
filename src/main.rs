@@ -804,12 +804,8 @@ fn ui(f: &mut Frame, app: &mut App) {
         Block::default()
             .borders(Borders::ALL)
             .title(format!(
-                "┌4 proc┐filter {}┐per-core {}┐reverse {}┐tree┐< {} {} >",
-                if app.filter_query.is_empty() {
-                    "<empty>".to_string()
-                } else {
-                    app.filter_query.clone()
-                },
+                "┌4 proc┐{}┐per-core {}┐reverse {}┐tree┐< {} {} >",
+                filter_mode_label(app),
                 "on",
                 if app.sort_reverse { "on" } else { "off" },
                 sort_name(app.sort_mode),
@@ -820,8 +816,12 @@ fn ui(f: &mut Frame, app: &mut App) {
     f.render_widget(Clear, proc_area);
     f.render_widget(table, proc_area);
 
-    let footer_left =
-        " ↑↓ select  / filter  x clear  t terminate  k kill  s signals  +/- rate  q quit ";
+    let footer_left = match app.input_mode {
+        InputMode::Filter => " ↑↓ select  / search: ACTIVE  Esc/Enter done  x clear  q quit ",
+        InputMode::Normal => {
+            " ↑↓ select  / search: inactive  x clear  t terminate  k kill  s signals  q quit "
+        }
+    };
     let current = if app.process_count() == 0 {
         0
     } else {
@@ -843,6 +843,25 @@ fn sort_name(mode: SortMode) -> &'static str {
         SortMode::Mem => "mem",
         SortMode::Pid => "pid",
         SortMode::Name => "name",
+    }
+}
+
+fn filter_mode_label(app: &App) -> String {
+    match app.input_mode {
+        InputMode::Filter => {
+            if app.filter_query.is_empty() {
+                "f _◄".to_string()
+            } else {
+                format!("f {}◄", app.filter_query)
+            }
+        }
+        InputMode::Normal => {
+            if app.filter_query.is_empty() {
+                "filter off".to_string()
+            } else {
+                format!("filter {}", app.filter_query)
+            }
+        }
     }
 }
 
