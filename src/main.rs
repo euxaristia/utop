@@ -72,6 +72,7 @@ struct App {
     tick_rate: Duration,
     cpu_count: usize,
     cpu_history: VecDeque<u64>,
+    core_usages: Vec<f32>,
     all_process_rows: Vec<ProcessRowData>,
     process_rows: Vec<ProcessRowData>,
     selected_process: usize,
@@ -90,6 +91,7 @@ impl App {
             tick_rate: Duration::from_millis(1000),
             cpu_count: 1,
             cpu_history: VecDeque::with_capacity(MAX_CPU_HISTORY),
+            core_usages: Vec::new(),
             all_process_rows: Vec::new(),
             process_rows: Vec::new(),
             selected_process: 0,
@@ -106,6 +108,12 @@ impl App {
     fn update(&mut self) {
         self.system.refresh_all();
         self.cpu_count = self.system.cpus().len().max(1);
+        self.core_usages = self
+            .system
+            .cpus()
+            .iter()
+            .map(|cpu| cpu.cpu_usage().clamp(0.0, 100.0))
+            .collect();
 
         let cpu_usage = self.system.global_cpu_usage().clamp(0.0, 100.0);
         self.cpu_history.push_back(cpu_usage as u64);
@@ -408,17 +416,20 @@ fn ui(f: &mut Frame, app: &mut App) {
         .constraints([Constraint::Percentage(34), Constraint::Percentage(66)])
         .split(root[1]);
 
+    let core_panel_height = (app.cpu_count as u16 + 3).clamp(6, 14);
     let left_panels = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(6),
-            Constraint::Length(6),
+            Constraint::Length(5),
+            Constraint::Length(core_panel_height),
+            Constraint::Length(4),
             Constraint::Length(4),
             Constraint::Length(4),
             Constraint::Min(0),
         ])
         .split(body[0]);
 
+    f.render_widget(Clear, left_panels[0]);
     let cpu_panel = LineGauge::default()
         .block(
             Block::default()
@@ -432,17 +443,42 @@ fn ui(f: &mut Frame, app: &mut App) {
     f.render_widget(cpu_panel, left_panels[0]);
 
     let cpu_points: Vec<u64> = app.cpu_history.iter().copied().collect();
-    let cpu_history = Sparkline::default()
+    let usage_bar = |usage: f32, width: usize| -> String {
+        let filled = ((usage.clamp(0.0, 100.0) / 100.0) * width as f32).round() as usize;
+        format!(
+            "{}{}",
+            "#".repeat(filled.min(width)),
+            ".".repeat(width.saturating_sub(filled))
+        )
+    };
+    let load = System::load_average();
+    let mut core_lines = Vec::with_capacity(app.core_usages.len() + 2);
+    core_lines.push(format!(
+        "overall {:>5.1}% ({} cores)",
+        cpu_usage, app.cpu_count
+    ));
+    for (i, usage) in app.core_usages.iter().enumerate() {
+        core_lines.push(format!(
+            "C{:<2} {} {:>5.1}%",
+            i,
+            usage_bar(*usage, 10),
+            usage
+        ));
+    }
+    core_lines.push(format!(
+        "load avg {:.2} {:.2} {:.2}",
+        load.one, load.five, load.fifteen
+    ));
+    let cpu_details = Paragraph::new(format!("{}", core_lines.join("\n")))
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" CPU History ")
+                .title(" Cores ")
                 .border_style(Style::default().fg(Color::Cyan)),
         )
-        .style(Style::default().fg(Color::Yellow))
-        .max(100)
-        .data(&cpu_points);
-    f.render_widget(cpu_history, left_panels[1]);
+        .style(Style::default().fg(Color::White));
+    f.render_widget(Clear, left_panels[1]);
+    f.render_widget(cpu_details, left_panels[1]);
 
     let total_mem = app.system.total_memory();
     let used_mem = app.system.used_memory();
@@ -473,6 +509,7 @@ fn ui(f: &mut Frame, app: &mut App) {
             mem_ratio * 100.0
         ))
         .ratio(mem_ratio.clamp(0.0, 1.0));
+    f.render_widget(Clear, left_panels[2]);
     f.render_widget(mem_panel, left_panels[2]);
 
     let swap_panel = Gauge::default()
@@ -490,9 +527,9 @@ fn ui(f: &mut Frame, app: &mut App) {
             swap_ratio * 100.0
         ))
         .ratio(swap_ratio.clamp(0.0, 1.0));
+    f.render_widget(Clear, left_panels[3]);
     f.render_widget(swap_panel, left_panels[3]);
 
-    let load = System::load_average();
     let filter_title = match app.input_mode {
         InputMode::Normal => " Filter ",
         InputMode::Filter => " Filter (typing) ",
@@ -502,18 +539,29 @@ fn ui(f: &mut Frame, app: &mut App) {
     } else {
         format!(" {} ", app.filter_query)
     };
-    let filter_panel = Paragraph::new(format!(
-        "{}\nload avg: {:.2} {:.2} {:.2}",
-        filter_text, load.one, load.five, load.fifteen
-    ))
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(filter_title)
-            .border_style(Style::default().fg(Color::LightBlue)),
-    )
-    .style(Style::default().fg(Color::White));
-    f.render_widget(filter_panel, left_panels[4]);
+    let cpu_sparkline = Sparkline::default()
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" CPU Trend ")
+                .border_style(Style::default().fg(Color::LightBlue)),
+        )
+        .style(Style::default().fg(Color::Yellow))
+        .max(100)
+        .data(&cpu_points);
+    f.render_widget(Clear, left_panels[4]);
+    f.render_widget(cpu_sparkline, left_panels[4]);
+
+    let filter_panel = Paragraph::new(filter_text)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(filter_title)
+                .border_style(Style::default().fg(Color::LightBlue)),
+        )
+        .style(Style::default().fg(Color::White));
+    f.render_widget(Clear, left_panels[5]);
+    f.render_widget(filter_panel, left_panels[5]);
 
     let table_visible_rows = body[1].height.saturating_sub(3) as usize;
     app.align_scroll_to_selection(table_visible_rows);
