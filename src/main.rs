@@ -435,6 +435,12 @@ fn ui(f: &mut Frame, app: &mut App) {
     let cpu_usage = app.system.global_cpu_usage().clamp(0.0, 100.0);
     let load = System::load_average();
     let refresh_ms = app.tick_rate.as_millis().min(9999);
+    let avg_freq_mhz = if app.system.cpus().is_empty() {
+        0
+    } else {
+        app.system.cpus().iter().map(|c| c.frequency()).sum::<u64>()
+            / app.system.cpus().len() as u64
+    };
 
     let top_block = Block::default()
         .borders(Borders::ALL)
@@ -496,9 +502,10 @@ fn ui(f: &mut Frame, app: &mut App) {
     let mini_inner = mini_block.inner(mini);
     f.render_widget(mini_block, mini);
     let mut lines = vec![format!(
-        "CPU {:<18} {:>5.1}%",
-        bar(cpu_usage, 12),
-        cpu_usage
+        "CPU {:<12} {:>5.1}% {:>4.1} GHz",
+        bar(cpu_usage, 8),
+        cpu_usage,
+        avg_freq_mhz as f64 / 1000.0
     )];
     for (i, u) in app.core_usages.iter().enumerate() {
         lines.push(format!("C{:<2} {:<18} {:>5.1}%", i, bar(*u, 12), u));
@@ -651,9 +658,32 @@ fn ui(f: &mut Frame, app: &mut App) {
     let start = app.process_scroll.min(app.process_count());
     let end = (start + table_visible_rows).min(app.process_count());
 
+    let cpu_header = if matches!(app.sort_mode, SortMode::Cpu) {
+        if app.sort_reverse {
+            "Cpu%↑"
+        } else {
+            "Cpu%↓"
+        }
+    } else {
+        "Cpu%"
+    };
+    let mem_header = if matches!(app.sort_mode, SortMode::Mem) {
+        if app.sort_reverse {
+            "MemB↑"
+        } else {
+            "MemB↓"
+        }
+    } else {
+        "MemB"
+    };
+    let pid_header = if matches!(app.sort_mode, SortMode::Pid) {
+        if app.sort_reverse { "Pid↓" } else { "Pid↑" }
+    } else {
+        "Pid"
+    };
     let header = Row::new(
         [
-            "Pid", "Program", "Command", "Threads", "User", "MemB", "Cpu%",
+            pid_header, "Program", "Command", "Threads", "User", mem_header, cpu_header,
         ]
         .into_iter()
         .map(Cell::from),
