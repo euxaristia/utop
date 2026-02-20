@@ -21,6 +21,7 @@ use std::{
 };
 use sysinfo::{
     CpuRefreshKind, Disks, Networks, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind,
+    Users,
 };
 
 const MAX_CPU_HISTORY: usize = 240;
@@ -113,6 +114,7 @@ struct App {
     system: System,
     disks: Disks,
     networks: Networks,
+    users: Users,
     last_tick: Instant,
     tick_rate: Duration,
     cpu_count: usize,
@@ -142,6 +144,7 @@ struct App {
     last_disk_refresh: Instant,
     last_process_refresh: Instant,
     last_ip_refresh: Instant,
+    last_user_refresh: Instant,
     modal: Option<ModalState>,
     status_msg: String,
 }
@@ -152,6 +155,7 @@ impl App {
             system: System::new_all(),
             disks: Disks::new_with_refreshed_list(),
             networks: Networks::new_with_refreshed_list(),
+            users: Users::new_with_refreshed_list(),
             last_tick: Instant::now(),
             tick_rate: Duration::from_millis(1000),
             cpu_count: 1,
@@ -181,6 +185,7 @@ impl App {
             last_disk_refresh: Instant::now(),
             last_process_refresh: Instant::now(),
             last_ip_refresh: Instant::now() - Duration::from_secs(30),
+            last_user_refresh: Instant::now() - Duration::from_secs(30),
             modal: None,
             status_msg: String::new(),
         };
@@ -214,6 +219,10 @@ impl App {
         if self.last_disk_refresh.elapsed() >= Duration::from_secs(5) {
             self.disks.refresh(false);
             self.last_disk_refresh = Instant::now();
+        }
+        if self.last_user_refresh.elapsed() >= Duration::from_secs(20) {
+            self.users.refresh();
+            self.last_user_refresh = Instant::now();
         }
         self.networks.refresh(true);
         self.cpu_count = self.system.cpus().len().max(1);
@@ -253,7 +262,10 @@ impl App {
                             .join(" "),
                         user: p
                             .user_id()
-                            .map(|uid| uid.to_string())
+                            .and_then(|uid| {
+                                self.users.get_user_by_id(uid).map(|u| u.name().to_string())
+                            })
+                            .or_else(|| p.user_id().map(|uid| uid.to_string()))
                             .unwrap_or_else(|| "-".to_string()),
                         threads: p.tasks().map_or(1, |tasks| tasks.len().max(1)),
                         cpu_raw_percent: p
@@ -704,7 +716,7 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     let top_block = Block::default()
         .borders(Borders::ALL)
-        .title("┌1 cpu┐┌menu┐┌preset *")
+        .title("┌1 cpu┐ ┌menu┐ ┌preset *┐")
         .border_style(Style::default().fg(Color::DarkGray));
     f.render_widget(Clear, root[0]);
     f.render_widget(top_block.clone(), root[0]);
@@ -845,7 +857,7 @@ fn ui(f: &mut Frame, app: &mut App) {
             let used_pct = pct(used, total) as f32;
             format!(
                 "{}\nUsed:{:>4.0}% {:<14} {:>6.1}G\nFree:{:>4.0}% {:<14} {:>6.1}G",
-                short_mount(disk.mount_point()),
+                friendly_mount(disk.mount_point()),
                 used_pct,
                 bar(used_pct, 10),
                 gib(used),
@@ -1028,12 +1040,12 @@ fn ui(f: &mut Frame, app: &mut App) {
         rows,
         [
             Constraint::Percentage(10),
-            Constraint::Percentage(16),
-            Constraint::Percentage(38),
+            Constraint::Percentage(15),
+            Constraint::Percentage(35),
             Constraint::Percentage(8),
             Constraint::Percentage(12),
             Constraint::Percentage(8),
-            Constraint::Percentage(8),
+            Constraint::Percentage(12),
         ],
     )
     .header(header)
@@ -1041,10 +1053,11 @@ fn ui(f: &mut Frame, app: &mut App) {
         Block::default()
             .borders(Borders::ALL)
             .title(format!(
-                "┌4 proc┐{}┐per-core {}┐reverse {}┐tree┐< {} {} >",
+                "┌4 proc┐ {} ┌per-core {}┐ ┌reverse {}┐ ┌tree {}┐ < {} {} >",
                 filter_mode_label(app),
                 if app.per_core { "on" } else { "off" },
                 if app.sort_reverse { "on" } else { "off" },
+                if app.tree_mode { "on" } else { "off" },
                 sort_name(app.sort_mode),
                 if app.proc_lazy { "lazy" } else { "resp" }
             ))
@@ -1193,12 +1206,20 @@ fn bar(value: f32, width: usize) -> String {
     s
 }
 
-fn short_mount(path: &Path) -> String {
+fn friendly_mount(path: &Path) -> String {
     let s = path.to_string_lossy();
-    if s.len() <= 10 {
+    if s == "/" {
+        "/".to_string()
+    } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        if name.is_empty() {
+            s.to_string()
+        } else {
+            name.to_string()
+        }
+    } else if s.len() <= 12 {
         s.to_string()
     } else {
-        format!("..{}", &s[s.len() - 10..])
+        format!("..{}", &s[s.len() - 12..])
     }
 }
 
