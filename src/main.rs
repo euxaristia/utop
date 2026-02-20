@@ -9,14 +9,15 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table},
+    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Sparkline, Table},
 };
 use std::{
     collections::VecDeque,
     io,
+    path::Path,
     time::{Duration, Instant},
 };
-use sysinfo::System;
+use sysinfo::{Disks, Networks, System};
 
 const MAX_CPU_HISTORY: usize = 240;
 const MIN_TICK_MS: u64 = 200;
@@ -62,6 +63,8 @@ enum InputMode {
 
 struct App {
     system: System,
+    disks: Disks,
+    networks: Networks,
     last_tick: Instant,
     tick_rate: Duration,
     cpu_count: usize,
@@ -75,12 +78,21 @@ struct App {
     sort_reverse: bool,
     filter_query: String,
     input_mode: InputMode,
+    net_iface: String,
+    net_rx_rate: f64,
+    net_tx_rate: f64,
+    net_rx_top: f64,
+    net_tx_top: f64,
+    net_rx_total: u64,
+    net_tx_total: u64,
 }
 
 impl App {
     fn new() -> Self {
         let mut app = Self {
             system: System::new_all(),
+            disks: Disks::new_with_refreshed_list(),
+            networks: Networks::new_with_refreshed_list(),
             last_tick: Instant::now(),
             tick_rate: Duration::from_millis(1000),
             cpu_count: 1,
@@ -94,13 +106,23 @@ impl App {
             sort_reverse: false,
             filter_query: String::new(),
             input_mode: InputMode::Normal,
+            net_iface: "-".to_string(),
+            net_rx_rate: 0.0,
+            net_tx_rate: 0.0,
+            net_rx_top: 0.0,
+            net_tx_top: 0.0,
+            net_rx_total: 0,
+            net_tx_total: 0,
         };
         app.update();
         app
     }
 
     fn update(&mut self) {
+        let elapsed = self.last_tick.elapsed().as_secs_f64().max(0.001);
         self.system.refresh_all();
+        self.disks.refresh(true);
+        self.networks.refresh(true);
         self.cpu_count = self.system.cpus().len().max(1);
         self.core_usages = self
             .system
@@ -140,6 +162,22 @@ impl App {
                 mem_bytes: p.memory(),
             })
             .collect();
+
+        let selected = self
+            .networks
+            .iter()
+            .filter(|(name, _)| !name.starts_with("lo"))
+            .max_by_key(|(_, data)| data.total_received() + data.total_transmitted())
+            .or_else(|| self.networks.iter().next());
+        if let Some((name, data)) = selected {
+            self.net_iface = name.clone();
+            self.net_rx_rate = data.received() as f64 / elapsed;
+            self.net_tx_rate = data.transmitted() as f64 / elapsed;
+            self.net_rx_top = self.net_rx_top.max(self.net_rx_rate);
+            self.net_tx_top = self.net_tx_top.max(self.net_tx_rate);
+            self.net_rx_total = data.total_received();
+            self.net_tx_total = data.total_transmitted();
+        }
 
         self.rebuild_process_rows();
     }
@@ -433,6 +471,23 @@ fn ui(f: &mut Frame, app: &mut App) {
         width: top_inner.width.min(38),
         height: top_inner.height.min(9),
     };
+    let graph_width = top_inner.width.saturating_sub(mini.width + 1);
+    if graph_width > 2 && top_inner.height > 2 {
+        let graph = Rect {
+            x: top_inner.x,
+            y: top_inner.y,
+            width: graph_width,
+            height: top_inner.height,
+        };
+        let history = app.cpu_history.iter().copied().collect::<Vec<_>>();
+        f.render_widget(
+            Sparkline::default()
+                .data(&history)
+                .max(100)
+                .style(Style::default().fg(Color::Green)),
+            graph,
+        );
+    }
     f.render_widget(Clear, mini);
     let mini_block = Block::default()
         .borders(Borders::ALL)
@@ -476,8 +531,6 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     let total_mem = app.system.total_memory();
     let used_mem = app.system.used_memory();
-    let total_swap = app.system.total_swap();
-    let used_swap = app.system.used_swap();
     let avail_mem = app.system.available_memory();
     let free_mem = app.system.free_memory();
     let cached_mem = total_mem.saturating_sub(used_mem).saturating_sub(free_mem);
@@ -513,29 +566,61 @@ fn ui(f: &mut Frame, app: &mut App) {
         .border_style(Style::default().fg(Color::Yellow));
     let disks_inner = disks_block.inner(upper_left[1]);
     f.render_widget(disks_block, upper_left[1]);
+    let disk_lines = app
+        .disks
+        .list()
+        .iter()
+        .take(4)
+        .map(|disk| {
+            let total = disk.total_space();
+            let avail = disk.available_space();
+            let used = total.saturating_sub(avail);
+            let used_pct = pct(used, total) as f32;
+            format!(
+                "{}\nUsed:{:>4.0}% {:<14} {:>6.1}G\nFree:{:>4.0}% {:<14} {:>6.1}G",
+                short_mount(disk.mount_point()),
+                used_pct,
+                bar(used_pct, 10),
+                gib(used),
+                100.0 - used_pct,
+                bar(100.0 - used_pct, 10),
+                gib(avail)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
     f.render_widget(
-        Paragraph::new(format!(
-            "root\nUsed:{:>4.0}% {:<18}\nFree:{:>4.0}% {:<18}\n\nswap\nUsed:{:>4.0}% {:<18}\nFree:{:>4.0}% {:<18}",
-            pct(used_mem, total_mem),
-            bar(pct(used_mem, total_mem) as f32, 12),
-            100.0 - pct(used_mem, total_mem),
-            bar((100.0 - pct(used_mem, total_mem)) as f32, 12),
-            pct(used_swap, total_swap),
-            bar(pct(used_swap, total_swap) as f32, 12),
-            100.0 - pct(used_swap, total_swap),
-            bar((100.0 - pct(used_swap, total_swap)) as f32, 12),
-        ))
+        Paragraph::new(if disk_lines.is_empty() {
+            "No disk data".to_string()
+        } else {
+            disk_lines
+        })
         .style(Style::default().fg(Color::White)),
         disks_inner,
     );
 
     f.render_widget(Clear, lower_left[0]);
+    let net_block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!("┌3 net┐ {}", app.net_iface))
+        .border_style(Style::default().fg(Color::Blue));
+    let net_inner = net_block.inner(lower_left[0]);
+    f.render_widget(Clear, lower_left[0]);
+    f.render_widget(net_block, lower_left[0]);
     f.render_widget(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("┌3 net┐")
-            .border_style(Style::default().fg(Color::Blue)),
-        lower_left[0],
+        Paragraph::new(format!(
+            "download {:>8}/s {:<16}\nup top  {:>8}/s\n\ntotal rx {:>10}\n\nupload   {:>8}/s {:<16}\nup top  {:>8}/s\n\ntotal tx {:>10}",
+            human_rate(app.net_rx_rate),
+            bar(rate_to_pct(app.net_rx_rate, app.net_rx_top), 10),
+            human_rate(app.net_rx_top),
+            human_bytes(app.net_rx_total),
+            human_rate(app.net_tx_rate),
+            bar(rate_to_pct(app.net_tx_rate, app.net_tx_top), 10),
+            human_rate(app.net_tx_top),
+            human_bytes(app.net_tx_total),
+        ))
+        .style(Style::default().fg(Color::White)),
+        net_inner,
     );
 
     f.render_widget(Clear, lower_left[1]);
@@ -547,12 +632,14 @@ fn ui(f: &mut Frame, app: &mut App) {
     f.render_widget(sync_block, lower_left[1]);
     f.render_widget(
         Paragraph::new(format!(
-            "download\n0 Byte/s\nTop: 0 bps\nTotal: 0 B\n\nupload\n0 Byte/s\nTop: 0 bps\nTotal: 0 B\n\nfilter: {}",
-            if app.filter_query.is_empty() {
-                "<none>".to_string()
-            } else {
-                app.filter_query.clone()
-            }
+            "download\n{:>8}/s\nTop:{:>9}/s\nTotal:{:>9}\n\nupload\n{:>8}/s\nTop:{:>9}/s\nTotal:{:>9}\n\n{}",
+            human_rate(app.net_rx_rate),
+            human_rate(app.net_rx_top),
+            human_bytes(app.net_rx_total),
+            human_rate(app.net_tx_rate),
+            human_rate(app.net_tx_top),
+            human_bytes(app.net_tx_total),
+            format!("sort={} rev={}", sort_name(app.sort_mode), if app.sort_reverse { "on" } else { "off" }),
         ))
         .style(Style::default().fg(Color::White)),
         sync_inner,
@@ -663,6 +750,36 @@ fn bar(value: f32, width: usize) -> String {
         s.push(if i < fill { '█' } else { '·' });
     }
     s
+}
+
+fn short_mount(path: &Path) -> String {
+    let s = path.to_string_lossy();
+    if s.len() <= 10 {
+        s.to_string()
+    } else {
+        format!("..{}", &s[s.len() - 10..])
+    }
+}
+
+fn human_rate(bytes_per_sec: f64) -> String {
+    let b = bytes_per_sec.max(0.0);
+    if b >= 1_073_741_824.0 {
+        format!("{:.1} GiB", b / 1_073_741_824.0)
+    } else if b >= 1_048_576.0 {
+        format!("{:.1} MiB", b / 1_048_576.0)
+    } else if b >= 1024.0 {
+        format!("{:.1} KiB", b / 1024.0)
+    } else {
+        format!("{:.0} B", b)
+    }
+}
+
+fn rate_to_pct(current: f64, top: f64) -> f32 {
+    if top <= 0.0 {
+        0.0
+    } else {
+        ((current / top) * 100.0).clamp(0.0, 100.0) as f32
+    }
 }
 
 fn gib(bytes: u64) -> f64 {
