@@ -55,6 +55,15 @@ impl SortMode {
             Self::Name => Self::Cpu,
         }
     }
+
+    fn prev(self) -> Self {
+        match self {
+            Self::Cpu => Self::Name,
+            Self::Mem => Self::Cpu,
+            Self::Pid => Self::Mem,
+            Self::Name => Self::Pid,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -103,6 +112,9 @@ struct App {
     process_scroll: usize,
     sort_mode: SortMode,
     sort_reverse: bool,
+    per_core: bool,
+    tree_mode: bool,
+    proc_lazy: bool,
     filter_query: String,
     input_mode: InputMode,
     net_iface: String,
@@ -139,6 +151,9 @@ impl App {
             process_scroll: 0,
             sort_mode: SortMode::Cpu,
             sort_reverse: false,
+            per_core: true,
+            tree_mode: false,
+            proc_lazy: true,
             filter_query: String::new(),
             input_mode: InputMode::Normal,
             net_iface: "-".to_string(),
@@ -401,6 +416,11 @@ impl App {
         self.rebuild_process_rows();
     }
 
+    fn cycle_sort_mode_prev(&mut self) {
+        self.sort_mode = self.sort_mode.prev();
+        self.rebuild_process_rows();
+    }
+
     fn speed_up_refresh(&mut self) {
         let ms = self.tick_rate.as_millis() as u64;
         let next = ms.saturating_sub(TICK_STEP_MS).max(MIN_TICK_MS);
@@ -411,6 +431,18 @@ impl App {
         let ms = self.tick_rate.as_millis() as u64;
         let next = (ms + TICK_STEP_MS).min(MAX_TICK_MS);
         self.tick_rate = Duration::from_millis(next);
+    }
+
+    fn toggle_per_core(&mut self) {
+        self.per_core = !self.per_core;
+    }
+
+    fn toggle_tree_mode(&mut self) {
+        self.tree_mode = !self.tree_mode;
+    }
+
+    fn toggle_proc_lazy(&mut self) {
+        self.proc_lazy = !self.proc_lazy;
     }
 
     fn start_filter_input(&mut self) {
@@ -584,7 +616,12 @@ where
                                         app.modal = Some(ModalState::SignalPicker { selected: 0 })
                                     }
                                     KeyCode::Char('o') => app.cycle_sort_mode(),
+                                    KeyCode::Left => app.cycle_sort_mode_prev(),
+                                    KeyCode::Right => app.cycle_sort_mode(),
                                     KeyCode::Char('r') => app.toggle_reverse(),
+                                    KeyCode::Char('e') => app.toggle_per_core(),
+                                    KeyCode::Char('w') => app.toggle_tree_mode(),
+                                    KeyCode::Char('l') => app.toggle_proc_lazy(),
                                     KeyCode::Char('c') => app.set_sort_mode(SortMode::Cpu),
                                     KeyCode::Char('m') => app.set_sort_mode(SortMode::Mem),
                                     KeyCode::Char('p') => app.set_sort_mode(SortMode::Pid),
@@ -864,7 +901,13 @@ fn ui(f: &mut Frame, app: &mut App) {
             human_rate(app.net_tx_rate),
             human_rate(app.net_tx_top),
             human_bytes(app.net_tx_total),
-            format!("sort={} rev={}", sort_name(app.sort_mode), if app.sort_reverse { "on" } else { "off" }),
+            format!(
+                "sort={} rev={} tree={} lazy={}",
+                sort_name(app.sort_mode),
+                if app.sort_reverse { "on" } else { "off" },
+                if app.tree_mode { "on" } else { "off" },
+                if app.proc_lazy { "on" } else { "off" }
+            ),
         ))
         .style(Style::default().fg(Color::White)),
         sync_inner,
@@ -963,10 +1006,10 @@ fn ui(f: &mut Frame, app: &mut App) {
             .title(format!(
                 "┌4 proc┐{}┐per-core {}┐reverse {}┐tree┐< {} {} >",
                 filter_mode_label(app),
-                "on",
+                if app.per_core { "on" } else { "off" },
                 if app.sort_reverse { "on" } else { "off" },
                 sort_name(app.sort_mode),
-                "lazy"
+                if app.proc_lazy { "lazy" } else { "resp" }
             ))
             .border_style(Style::default().fg(Color::Red)),
     );
@@ -976,7 +1019,7 @@ fn ui(f: &mut Frame, app: &mut App) {
     let footer_left = match app.input_mode {
         InputMode::Filter => " ↑↓ select  / search: ACTIVE  Esc/Enter done  x clear  q quit ",
         InputMode::Normal => {
-            " ↑↓ select  / search: inactive  x clear  t term  k kill  s signals  o sort  q quit "
+            " ↑↓ select  / search: inactive  x clear  t term  k kill  s signals  ←/→ sort  r rev  e per-core  w tree  l lazy  q quit "
         }
     };
     let current = if app.process_count() == 0 {
