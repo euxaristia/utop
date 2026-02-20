@@ -75,9 +75,20 @@ struct ProcessRowData {
     command: String,
     user: String,
     threads: usize,
+    cpu_raw_percent: f32,
     cpu_total_percent: f32,
     mem_percent: f64,
     mem_bytes: u64,
+}
+
+impl ProcessRowData {
+    fn display_cpu(&self, per_core: bool) -> f32 {
+        if per_core {
+            self.cpu_total_percent
+        } else {
+            self.cpu_raw_percent
+        }
+    }
 }
 
 enum InputMode {
@@ -181,9 +192,10 @@ impl App {
         self.system
             .refresh_cpu_specifics(CpuRefreshKind::nothing().with_cpu_usage());
         self.system.refresh_memory();
+        let process_interval = if self.proc_lazy { 1500 } else { 600 };
         let mut process_refreshed = false;
         if self.all_process_rows.is_empty()
-            || self.last_process_refresh.elapsed() >= Duration::from_millis(1500)
+            || self.last_process_refresh.elapsed() >= Duration::from_millis(process_interval)
         {
             self.system.refresh_processes_specifics(
                 ProcessesToUpdate::All,
@@ -242,6 +254,9 @@ impl App {
                             .map(|uid| uid.to_string())
                             .unwrap_or_else(|| "-".to_string()),
                         threads: p.tasks().map_or(1, |tasks| tasks.len().max(1)),
+                        cpu_raw_percent: p
+                            .cpu_usage()
+                            .clamp(0.0, (self.cpu_count as f32 * 100.0).max(100.0)),
                         cpu_total_percent: (p.cpu_usage() / self.cpu_count as f32)
                             .clamp(0.0, 100.0),
                         mem_percent: (p.memory() as f64 / total_mem * 100.0).clamp(0.0, 100.0),
@@ -310,8 +325,8 @@ impl App {
 
         rows.sort_by(|a, b| match self.sort_mode {
             SortMode::Cpu => b
-                .cpu_total_percent
-                .total_cmp(&a.cpu_total_percent)
+                .display_cpu(self.per_core)
+                .total_cmp(&a.display_cpu(self.per_core))
                 .then_with(|| b.mem_percent.total_cmp(&a.mem_percent)),
             SortMode::Mem => b
                 .mem_percent
@@ -435,14 +450,18 @@ impl App {
 
     fn toggle_per_core(&mut self) {
         self.per_core = !self.per_core;
+        self.status_msg = format!("per-core {}", if self.per_core { "on" } else { "off" });
+        self.rebuild_process_rows();
     }
 
     fn toggle_tree_mode(&mut self) {
         self.tree_mode = !self.tree_mode;
+        self.status_msg = format!("tree {}", if self.tree_mode { "on" } else { "off" });
     }
 
     fn toggle_proc_lazy(&mut self) {
         self.proc_lazy = !self.proc_lazy;
+        self.status_msg = format!("lazy {}", if self.proc_lazy { "on" } else { "off" });
     }
 
     fn start_filter_input(&mut self) {
@@ -599,7 +618,7 @@ where
                                         return Ok(());
                                     }
                                     KeyCode::Down | KeyCode::Char('j') => app.next_process(),
-                                    KeyCode::Up => app.previous_process(),
+                                    KeyCode::Up | KeyCode::Char('u') => app.previous_process(),
                                     KeyCode::PageDown => app.page_down(page_size),
                                     KeyCode::PageUp => app.page_up(page_size),
                                     KeyCode::Home => app.jump_top(),
@@ -944,7 +963,7 @@ fn ui(f: &mut Frame, app: &mut App) {
     };
     let header = Row::new(
         [
-            pid_header, "Program", "Command", "Threads", "User", mem_header, cpu_header,
+            pid_header, "Program:", "Command:", "Threads:", "User:", mem_header, cpu_header,
         ]
         .into_iter()
         .map(Cell::from),
@@ -967,6 +986,12 @@ fn ui(f: &mut Frame, app: &mut App) {
             if absolute_index == app.selected_process {
                 row_style = Style::default().fg(Color::Black).bg(Color::Yellow);
             }
+            let cpu_pct = p.display_cpu(app.per_core);
+            let cpu_bar_pct = if app.per_core {
+                cpu_pct
+            } else {
+                (cpu_pct / app.cpu_count as f32).clamp(0.0, 100.0)
+            };
             Row::new(vec![
                 Cell::from(p.pid.clone()),
                 Cell::from(p.name.clone()),
@@ -978,11 +1003,7 @@ fn ui(f: &mut Frame, app: &mut App) {
                 Cell::from(format!("{}", p.threads)),
                 Cell::from(p.user.clone()),
                 Cell::from(format!("{:>6}", human_bytes(p.mem_bytes))),
-                Cell::from(format!(
-                    "{} {:>4.1}",
-                    bar(p.cpu_total_percent, 5),
-                    p.cpu_total_percent
-                )),
+                Cell::from(format!("{} {:>4.1}", bar(cpu_bar_pct, 5), cpu_pct)),
             ])
             .style(row_style)
         });
@@ -1019,7 +1040,7 @@ fn ui(f: &mut Frame, app: &mut App) {
     let footer_left = match app.input_mode {
         InputMode::Filter => " ↑↓ select  / search: ACTIVE  Esc/Enter done  x clear  q quit ",
         InputMode::Normal => {
-            " ↑↓ select  / search: inactive  x clear  t term  k kill  s signals  ←/→ sort  r rev  e per-core  w tree  l lazy  q quit "
+            " ↑/u↓/j select  / search: inactive  x clear  t term  k kill  s signals  ←/→ sort  r rev  e per-core  w tree  l lazy  q quit "
         }
     };
     let current = if app.process_count() == 0 {
