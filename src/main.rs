@@ -21,7 +21,7 @@ use sysinfo::System;
 struct App {
     system: System,
     last_tick: Instant,
-    cpu_history: Vec<u64>,
+    cpu_history: Vec<f32>,
     process_state: TableState,
     process_count: usize,
 }
@@ -41,7 +41,8 @@ impl App {
 
     fn update(&mut self) {
         self.system.refresh_all();
-        let cpu_usage = self.system.global_cpu_usage() as u64;
+        // Clamp CPU usage to 0-100 range (can exceed 100 on multi-core systems)
+        let cpu_usage = self.system.global_cpu_usage().clamp(0.0, 100.0);
         self.cpu_history.push(cpu_usage);
         if self.cpu_history.len() > 1000 {
             self.cpu_history.remove(0);
@@ -151,19 +152,21 @@ fn ui(f: &mut Frame, app: &mut App) {
         ])
         .split(f.area());
 
-    // CPU Usage Gauge
-    let cpu_usage = app.system.global_cpu_usage();
+    // CPU Usage Gauge - clamp to 0-100% range
+    let cpu_usage = app.system.global_cpu_usage().clamp(0.0, 100.0);
     let cpu_gauge = LineGauge::default()
         .block(Block::default().borders(Borders::ALL).title(" CPU Usage "))
         .filled_style(Style::default().fg(Color::Cyan))
         .filled_symbol(symbols::line::THICK_VERTICAL)
-        .ratio(cpu_usage as f64 / 100.0);
+        .ratio((cpu_usage as f64 / 100.0).clamp(0.0, 1.0));
     f.render_widget(cpu_gauge, chunks[0]);
 
-    // CPU Sparkline
+    // CPU Sparkline - convert f32 to u64 for sparkline rendering
+    let sparkline_data: Vec<u64> = app.cpu_history.iter().map(|&v| v as u64).collect();
     let sparkline = Sparkline::default()
         .block(Block::default().borders(Borders::ALL).title(" CPU History "))
-        .data(&app.cpu_history)
+        .data(&sparkline_data)
+        .max(100)
         .style(Style::default().fg(Color::Yellow));
     f.render_widget(sparkline, chunks[1]);
 
@@ -200,10 +203,11 @@ fn ui(f: &mut Frame, app: &mut App) {
         .height(1);
 
     let rows = processes.iter().map(|p| {
+        let cpu_percent = p.cpu_usage().clamp(0.0, f32::MAX);
         let cells = vec!(
             Cell::from(p.pid().to_string()),
             Cell::from(p.name().to_string_lossy().into_owned()),
-            Cell::from(format!("{:.1}", p.cpu_usage())),
+            Cell::from(format!("{:.1}", cpu_percent)),
             Cell::from(format!(
                 "{:.1}",
                 (p.memory() as f64 / total_mem as f64) * 100.0
