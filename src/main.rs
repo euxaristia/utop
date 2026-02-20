@@ -820,11 +820,19 @@ fn ui(f: &mut Frame, app: &mut App) {
     f.render_widget(Clear, proc_area);
     f.render_widget(table, proc_area);
 
+    let footer_left =
+        " ↑↓ select  / filter  x clear  t terminate  k kill  s signals  +/- rate  q quit ";
+    let current = if app.process_count() == 0 {
+        0
+    } else {
+        app.selected_process + 1
+    };
+    let footer_right = format!("{current}/{}", app.process_count());
+    let width = root[2].width as usize;
+    let spacer = width.saturating_sub(footer_left.chars().count() + footer_right.len());
     f.render_widget(
-        Paragraph::new(
-            " ↑↓ select  / filter  x clear  t terminate  k kill  s signals  +/- rate  q quit ",
-        )
-        .style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(format!("{footer_left}{}{footer_right}", " ".repeat(spacer)))
+            .style(Style::default().fg(Color::DarkGray)),
         root[2],
     );
 }
