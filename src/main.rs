@@ -1,6 +1,6 @@
 use color_eyre::Result;
 use crossterm::{
-    event::{self, Event, KeyCode},
+    event::{self, Event, KeyCode, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -9,7 +9,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     symbols,
-    widgets::{Block, Borders, Cell, Gauge, LineGauge, Paragraph, Row, Sparkline, Table, TableState},
+    widgets::{Block, Borders, Cell, Clear, Gauge, LineGauge, Paragraph, Row, Sparkline, Table, TableState},
     Frame, Terminal,
 };
 use std::{
@@ -126,6 +126,9 @@ where
             if let Event::Key(key) = event::read()? {
                 match key.code {
                     KeyCode::Char('q') => return Ok(()),
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Ok(())
+                    }
                     KeyCode::Down | KeyCode::Char('j') => app.next_process(),
                     KeyCode::Up | KeyCode::Char('k') => app.previous_process(),
                     _ => {}
@@ -235,6 +238,8 @@ fn ui(f: &mut Frame, app: &mut App) {
     .block(Block::default().borders(Borders::ALL).title(title))
     .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED));
 
+    // Clear stale cells/styles from previous frames before drawing a frequently changing table.
+    f.render_widget(Clear, chunks[3]);
     f.render_stateful_widget(t, chunks[3], &mut app.process_state);
 
     let help_message = Paragraph::new("Quit: q | Move: ↑/↓ or j/k")
