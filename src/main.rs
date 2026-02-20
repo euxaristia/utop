@@ -414,6 +414,7 @@ fn ui(f: &mut Frame, app: &mut App) {
             Constraint::Length(6),
             Constraint::Length(6),
             Constraint::Length(4),
+            Constraint::Length(4),
             Constraint::Min(0),
         ])
         .split(body[0]);
@@ -461,21 +462,35 @@ fn ui(f: &mut Frame, app: &mut App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Memory ")
+                .title(" Memory (RAM) ")
                 .border_style(Style::default().fg(Color::Green)),
         )
         .gauge_style(Style::default().fg(Color::Green))
         .label(format!(
-            " RAM {:.2}/{:.2} GiB ({:.1}%) | SWAP {:.2}/{:.2} GiB ({:.1}%) ",
+            " {:.2}/{:.2} GiB ({:.1}%) ",
             used_mem as f64 / 1_073_741_824.0,
             total_mem as f64 / 1_073_741_824.0,
-            mem_ratio * 100.0,
+            mem_ratio * 100.0
+        ))
+        .ratio(mem_ratio.clamp(0.0, 1.0));
+    f.render_widget(mem_panel, left_panels[2]);
+
+    let swap_panel = Gauge::default()
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Swap ")
+                .border_style(Style::default().fg(Color::LightBlue)),
+        )
+        .gauge_style(Style::default().fg(Color::LightBlue))
+        .label(format!(
+            " {:.2}/{:.2} GiB ({:.1}%) ",
             used_swap as f64 / 1_073_741_824.0,
             total_swap as f64 / 1_073_741_824.0,
             swap_ratio * 100.0
         ))
-        .ratio(mem_ratio.clamp(0.0, 1.0));
-    f.render_widget(mem_panel, left_panels[2]);
+        .ratio(swap_ratio.clamp(0.0, 1.0));
+    f.render_widget(swap_panel, left_panels[3]);
 
     let load = System::load_average();
     let filter_title = match app.input_mode {
@@ -498,7 +513,7 @@ fn ui(f: &mut Frame, app: &mut App) {
             .border_style(Style::default().fg(Color::LightBlue)),
     )
     .style(Style::default().fg(Color::White));
-    f.render_widget(filter_panel, left_panels[3]);
+    f.render_widget(filter_panel, left_panels[4]);
 
     let table_visible_rows = body[1].height.saturating_sub(3) as usize;
     app.align_scroll_to_selection(table_visible_rows);
