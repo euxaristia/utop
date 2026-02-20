@@ -16,6 +16,7 @@ use std::{
     io,
     net::UdpSocket,
     path::Path,
+    process::Command,
     time::{Duration, Instant},
 };
 use sysinfo::{
@@ -23,9 +24,19 @@ use sysinfo::{
 };
 
 const MAX_CPU_HISTORY: usize = 240;
+const MAX_NET_HISTORY: usize = 180;
 const MIN_TICK_MS: u64 = 200;
 const MAX_TICK_MS: u64 = 5000;
 const TICK_STEP_MS: u64 = 100;
+
+const SIGNAL_OPTIONS: [(&str, &str); 6] = [
+    ("TERM", "-TERM"),
+    ("KILL", "-KILL"),
+    ("INT", "-INT"),
+    ("HUP", "-HUP"),
+    ("USR1", "-USR1"),
+    ("USR2", "-USR2"),
+];
 
 #[derive(Clone, Copy)]
 enum SortMode {
@@ -65,6 +76,18 @@ enum InputMode {
     Filter,
 }
 
+enum ModalState {
+    Confirm {
+        pid: u32,
+        name: String,
+        signal_name: &'static str,
+        signal_arg: &'static str,
+    },
+    SignalPicker {
+        selected: usize,
+    },
+}
+
 struct App {
     system: System,
     disks: Disks,
@@ -89,10 +112,14 @@ struct App {
     net_tx_top: f64,
     net_rx_total: u64,
     net_tx_total: u64,
+    net_rx_history: VecDeque<u64>,
+    net_tx_history: VecDeque<u64>,
     net_ip: String,
     last_disk_refresh: Instant,
     last_process_refresh: Instant,
     last_ip_refresh: Instant,
+    modal: Option<ModalState>,
+    status_msg: String,
 }
 
 impl App {
@@ -121,10 +148,14 @@ impl App {
             net_tx_top: 0.0,
             net_rx_total: 0,
             net_tx_total: 0,
+            net_rx_history: VecDeque::with_capacity(MAX_NET_HISTORY),
+            net_tx_history: VecDeque::with_capacity(MAX_NET_HISTORY),
             net_ip: "-".to_string(),
             last_disk_refresh: Instant::now(),
             last_process_refresh: Instant::now(),
             last_ip_refresh: Instant::now() - Duration::from_secs(30),
+            modal: None,
+            status_msg: String::new(),
         };
         app.update();
         app
@@ -227,6 +258,14 @@ impl App {
             self.net_tx_top = self.net_tx_top.max(self.net_tx_rate);
             self.net_rx_total = data.total_received();
             self.net_tx_total = data.total_transmitted();
+            self.net_rx_history.push_back(self.net_rx_rate as u64);
+            self.net_tx_history.push_back(self.net_tx_rate as u64);
+            while self.net_rx_history.len() > MAX_NET_HISTORY {
+                self.net_rx_history.pop_front();
+            }
+            while self.net_tx_history.len() > MAX_NET_HISTORY {
+                self.net_tx_history.pop_front();
+            }
         }
         if self.last_ip_refresh.elapsed() >= Duration::from_secs(15) {
             if let Some(ip) = detect_local_ip() {
@@ -399,6 +438,81 @@ impl App {
             _ => {}
         }
     }
+
+    fn selected_process_row(&self) -> Option<&ProcessRowData> {
+        self.process_rows.get(self.selected_process)
+    }
+
+    fn open_confirm_for_selected(&mut self, signal_name: &'static str, signal_arg: &'static str) {
+        if let Some(row) = self.selected_process_row() {
+            self.modal = Some(ModalState::Confirm {
+                pid: row.pid_num,
+                name: row.name.clone(),
+                signal_name,
+                signal_arg,
+            });
+        } else {
+            self.status_msg = "No process selected".to_string();
+        }
+    }
+
+    fn apply_signal(&mut self, pid: u32, signal_name: &str, signal_arg: &str) {
+        let status = Command::new("kill")
+            .arg(signal_arg)
+            .arg(pid.to_string())
+            .status();
+        self.status_msg = match status {
+            Ok(s) if s.success() => format!("Sent SIG{signal_name} to pid {pid}"),
+            Ok(s) => format!("kill exited with status {s}"),
+            Err(e) => format!("Failed to send signal: {e}"),
+        };
+        self.update();
+    }
+
+    fn handle_modal_key(&mut self, code: KeyCode) {
+        let mut next_modal = self.modal.take();
+        if let Some(modal) = next_modal.take() {
+            match modal {
+                ModalState::Confirm {
+                    pid,
+                    name,
+                    signal_name,
+                    signal_arg,
+                } => match code {
+                    KeyCode::Esc | KeyCode::Char('n') => {}
+                    KeyCode::Enter | KeyCode::Char('y') => {
+                        self.apply_signal(pid, signal_name, signal_arg);
+                    }
+                    _ => {
+                        self.modal = Some(ModalState::Confirm {
+                            pid,
+                            name,
+                            signal_name,
+                            signal_arg,
+                        });
+                    }
+                },
+                ModalState::SignalPicker { mut selected } => match code {
+                    KeyCode::Esc => {}
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        selected = (selected + 1).min(SIGNAL_OPTIONS.len() - 1);
+                        self.modal = Some(ModalState::SignalPicker { selected });
+                    }
+                    KeyCode::Up => {
+                        selected = selected.saturating_sub(1);
+                        self.modal = Some(ModalState::SignalPicker { selected });
+                    }
+                    KeyCode::Enter => {
+                        let (name, arg) = SIGNAL_OPTIONS[selected];
+                        self.open_confirm_for_selected(name, arg);
+                    }
+                    _ => {
+                        self.modal = Some(ModalState::SignalPicker { selected });
+                    }
+                },
+            }
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -438,34 +552,51 @@ where
         if event::poll(timeout)? {
             loop {
                 if let Event::Key(key) = event::read()? {
-                    match app.input_mode {
-                        InputMode::Filter => app.handle_filter_key(key.code),
-                        InputMode::Normal => {
-                            let page_size = terminal.size()?.height.saturating_sub(14) as usize;
-                            match key.code {
-                                KeyCode::Char('q') => return Ok(()),
-                                KeyCode::Char('c')
-                                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                                {
-                                    return Ok(());
+                    if app.modal.is_some() {
+                        app.handle_modal_key(key.code);
+                    } else {
+                        match app.input_mode {
+                            InputMode::Filter => app.handle_filter_key(key.code),
+                            InputMode::Normal => {
+                                let page_size = terminal.size()?.height.saturating_sub(14) as usize;
+                                match key.code {
+                                    KeyCode::Char('q') => return Ok(()),
+                                    KeyCode::Char('c')
+                                        if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                    {
+                                        return Ok(());
+                                    }
+                                    KeyCode::Down | KeyCode::Char('j') => app.next_process(),
+                                    KeyCode::Up => app.previous_process(),
+                                    KeyCode::PageDown => app.page_down(page_size),
+                                    KeyCode::PageUp => app.page_up(page_size),
+                                    KeyCode::Home => app.jump_top(),
+                                    KeyCode::End => app.jump_bottom(),
+                                    KeyCode::Char('/') => app.start_filter_input(),
+                                    KeyCode::Char('x') => app.clear_filter(),
+                                    KeyCode::Char('t') => {
+                                        app.open_confirm_for_selected("TERM", "-TERM")
+                                    }
+                                    KeyCode::Char('k') => {
+                                        app.open_confirm_for_selected("KILL", "-KILL")
+                                    }
+                                    KeyCode::Char('s') => {
+                                        app.modal = Some(ModalState::SignalPicker { selected: 0 })
+                                    }
+                                    KeyCode::Char('o') => app.cycle_sort_mode(),
+                                    KeyCode::Char('r') => app.toggle_reverse(),
+                                    KeyCode::Char('c') => app.set_sort_mode(SortMode::Cpu),
+                                    KeyCode::Char('m') => app.set_sort_mode(SortMode::Mem),
+                                    KeyCode::Char('p') => app.set_sort_mode(SortMode::Pid),
+                                    KeyCode::Char('n') => app.set_sort_mode(SortMode::Name),
+                                    KeyCode::Char('+') | KeyCode::Char('=') => {
+                                        app.speed_up_refresh()
+                                    }
+                                    KeyCode::Char('-') | KeyCode::Char('_') => {
+                                        app.slow_down_refresh()
+                                    }
+                                    _ => {}
                                 }
-                                KeyCode::Down | KeyCode::Char('j') => app.next_process(),
-                                KeyCode::Up | KeyCode::Char('k') => app.previous_process(),
-                                KeyCode::PageDown => app.page_down(page_size),
-                                KeyCode::PageUp => app.page_up(page_size),
-                                KeyCode::Home => app.jump_top(),
-                                KeyCode::End => app.jump_bottom(),
-                                KeyCode::Char('/') => app.start_filter_input(),
-                                KeyCode::Char('x') => app.clear_filter(),
-                                KeyCode::Char('s') => app.cycle_sort_mode(),
-                                KeyCode::Char('r') => app.toggle_reverse(),
-                                KeyCode::Char('c') => app.set_sort_mode(SortMode::Cpu),
-                                KeyCode::Char('m') => app.set_sort_mode(SortMode::Mem),
-                                KeyCode::Char('p') => app.set_sort_mode(SortMode::Pid),
-                                KeyCode::Char('n') => app.set_sort_mode(SortMode::Name),
-                                KeyCode::Char('+') | KeyCode::Char('=') => app.speed_up_refresh(),
-                                KeyCode::Char('-') | KeyCode::Char('_') => app.slow_down_refresh(),
-                                _ => {}
                             }
                         }
                     }
@@ -675,6 +806,32 @@ fn ui(f: &mut Frame, app: &mut App) {
     let net_inner = net_block.inner(lower_left[0]);
     f.render_widget(Clear, lower_left[0]);
     f.render_widget(net_block, lower_left[0]);
+    let net_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(5),
+        ])
+        .split(net_inner);
+    let rx_hist = app.net_rx_history.iter().copied().collect::<Vec<_>>();
+    let tx_hist = app.net_tx_history.iter().copied().collect::<Vec<_>>();
+    let rx_max = rx_hist.iter().copied().max().unwrap_or(1).max(1);
+    let tx_max = tx_hist.iter().copied().max().unwrap_or(1).max(1);
+    f.render_widget(
+        Sparkline::default()
+            .data(&rx_hist)
+            .max(rx_max)
+            .style(Style::default().fg(Color::Cyan)),
+        net_chunks[0],
+    );
+    f.render_widget(
+        Sparkline::default()
+            .data(&tx_hist)
+            .max(tx_max)
+            .style(Style::default().fg(Color::Green)),
+        net_chunks[1],
+    );
     f.render_widget(
         Paragraph::new(format!(
             "download {:>8}/s {:<16}\nup top  {:>8}/s\n\ntotal rx {:>10}\n\nupload   {:>8}/s {:<16}\nup top  {:>8}/s\n\ntotal tx {:>10}",
@@ -688,7 +845,7 @@ fn ui(f: &mut Frame, app: &mut App) {
             human_bytes(app.net_tx_total),
         ))
         .style(Style::default().fg(Color::White)),
-        net_inner,
+        net_chunks[2],
     );
 
     f.render_widget(Clear, lower_left[1]);
@@ -819,7 +976,7 @@ fn ui(f: &mut Frame, app: &mut App) {
     let footer_left = match app.input_mode {
         InputMode::Filter => " ↑↓ select  / search: ACTIVE  Esc/Enter done  x clear  q quit ",
         InputMode::Normal => {
-            " ↑↓ select  / search: inactive  x clear  t terminate  k kill  s signals  q quit "
+            " ↑↓ select  / search: inactive  x clear  t term  k kill  s signals  o sort  q quit "
         }
     };
     let current = if app.process_count() == 0 {
@@ -835,6 +992,88 @@ fn ui(f: &mut Frame, app: &mut App) {
             .style(Style::default().fg(Color::DarkGray)),
         root[2],
     );
+
+    if !app.status_msg.is_empty() {
+        let status_area = Rect {
+            x: root[2].x,
+            y: root[2].y.saturating_sub(1),
+            width: root[2].width.min(f.area().width),
+            height: 1,
+        };
+        f.render_widget(
+            Paragraph::new(format!(" {}", app.status_msg))
+                .style(Style::default().fg(Color::Yellow)),
+            status_area,
+        );
+    }
+
+    if let Some(modal) = &app.modal {
+        let area = centered_rect(56, 8, f.area());
+        f.render_widget(Clear, area);
+        match modal {
+            ModalState::Confirm {
+                pid,
+                name,
+                signal_name,
+                ..
+            } => {
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .title("confirm signal")
+                    .border_style(Style::default().fg(Color::Red));
+                let inner = block.inner(area);
+                f.render_widget(block, area);
+                f.render_widget(
+                    Paragraph::new(format!(
+                        "Send SIG{} to {} (pid {})?\n\n[y]/Enter = yes   [n]/Esc = no",
+                        signal_name, name, pid
+                    ))
+                    .style(Style::default().fg(Color::White)),
+                    inner,
+                );
+            }
+            ModalState::SignalPicker { selected } => {
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .title("select signal")
+                    .border_style(Style::default().fg(Color::Red));
+                let inner = block.inner(area);
+                f.render_widget(block, area);
+                let lines = SIGNAL_OPTIONS
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (name, _))| {
+                        if i == *selected {
+                            format!("> SIG{name}")
+                        } else {
+                            format!("  SIG{name}")
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                f.render_widget(
+                    Paragraph::new(format!(
+                        "{lines}\n\n↑/↓ choose   Enter confirm   Esc cancel"
+                    ))
+                    .style(Style::default().fg(Color::White)),
+                    inner,
+                );
+            }
+        }
+    }
+}
+
+fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
+    let width = area.width.saturating_mul(percent_x).saturating_div(100);
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let h = height.min(area.height.saturating_sub(2)).max(3);
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    Rect {
+        x,
+        y,
+        width,
+        height: h,
+    }
 }
 
 fn sort_name(mode: SortMode) -> &'static str {
