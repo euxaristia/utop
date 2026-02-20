@@ -14,6 +14,7 @@ use ratatui::{
 use std::{
     collections::VecDeque,
     io,
+    net::UdpSocket,
     path::Path,
     time::{Duration, Instant},
 };
@@ -88,8 +89,10 @@ struct App {
     net_tx_top: f64,
     net_rx_total: u64,
     net_tx_total: u64,
+    net_ip: String,
     last_disk_refresh: Instant,
     last_process_refresh: Instant,
+    last_ip_refresh: Instant,
 }
 
 impl App {
@@ -118,8 +121,10 @@ impl App {
             net_tx_top: 0.0,
             net_rx_total: 0,
             net_tx_total: 0,
+            net_ip: "-".to_string(),
             last_disk_refresh: Instant::now(),
             last_process_refresh: Instant::now(),
+            last_ip_refresh: Instant::now() - Duration::from_secs(30),
         };
         app.update();
         app
@@ -222,6 +227,12 @@ impl App {
             self.net_tx_top = self.net_tx_top.max(self.net_tx_rate);
             self.net_rx_total = data.total_received();
             self.net_tx_total = data.total_transmitted();
+        }
+        if self.last_ip_refresh.elapsed() >= Duration::from_secs(15) {
+            if let Some(ip) = detect_local_ip() {
+                self.net_ip = ip;
+            }
+            self.last_ip_refresh = Instant::now();
         }
     }
 
@@ -659,7 +670,7 @@ fn ui(f: &mut Frame, app: &mut App) {
     f.render_widget(Clear, lower_left[0]);
     let net_block = Block::default()
         .borders(Borders::ALL)
-        .title(format!("┌3 net┐ {}", app.net_iface))
+        .title(format!("┌3 net┐ {} {}", app.net_iface, app.net_ip))
         .border_style(Style::default().fg(Color::Blue));
     let net_inner = net_block.inner(lower_left[0]);
     f.render_widget(Clear, lower_left[0]);
@@ -767,7 +778,11 @@ fn ui(f: &mut Frame, app: &mut App) {
                 Cell::from(format!("{}", p.threads)),
                 Cell::from(p.user.clone()),
                 Cell::from(format!("{:>6}", human_bytes(p.mem_bytes))),
-                Cell::from(format!("{:>5.1}", p.cpu_total_percent)),
+                Cell::from(format!(
+                    "{} {:>4.1}",
+                    bar(p.cpu_total_percent, 5),
+                    p.cpu_total_percent
+                )),
             ])
             .style(row_style)
         });
@@ -807,7 +822,7 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     f.render_widget(
         Paragraph::new(
-            " q/Ctrl+C quit | j/k/PgUp/PgDn/Home/End move | / filter | x clear | s sort | r reverse | c/m/p/n | +/- refresh ",
+            " ↑↓ select  / filter  x clear  t terminate  k kill  s signals  +/- rate  q quit ",
         )
         .style(Style::default().fg(Color::DarkGray)),
         root[2],
@@ -870,6 +885,13 @@ fn trim_text(s: &str, max_chars: usize) -> String {
     } else {
         out
     }
+}
+
+fn detect_local_ip() -> Option<String> {
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    let addr = socket.local_addr().ok()?;
+    Some(addr.ip().to_string())
 }
 
 fn gib(bytes: u64) -> f64 {
