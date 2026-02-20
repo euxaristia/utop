@@ -7,10 +7,9 @@ use crossterm::{
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    symbols,
-    widgets::{Block, Borders, Cell, Clear, Gauge, LineGauge, Paragraph, Row, Sparkline, Table},
+    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table},
 };
 use std::{
     collections::VecDeque,
@@ -33,15 +32,6 @@ enum SortMode {
 }
 
 impl SortMode {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Cpu => "cpu",
-            Self::Mem => "mem",
-            Self::Pid => "pid",
-            Self::Name => "name",
-        }
-    }
-
     fn next(self) -> Self {
         match self {
             Self::Cpu => Self::Mem,
@@ -382,277 +372,234 @@ fn ui(f: &mut Frame, app: &mut App) {
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
-            Constraint::Min(0),
+            Constraint::Length(14),
+            Constraint::Min(12),
             Constraint::Length(1),
         ])
         .split(f.area());
 
     let cpu_usage = app.system.global_cpu_usage().clamp(0.0, 100.0);
-    let refresh_left_ms = app
-        .tick_rate
-        .saturating_sub(app.last_tick.elapsed())
-        .as_millis()
-        .min(9999);
-    let topbar = Paragraph::new(format!(
-        " rtop | CPU {:>5.1}% | cores {} | procs {:>4} | sort {}{} | refresh {:>4}ms ",
-        cpu_usage,
-        app.cpu_count,
-        app.process_count(),
-        app.sort_mode.label(),
-        if app.sort_reverse { " desc" } else { " asc" },
-        refresh_left_ms
-    ))
-    .style(
-        Style::default()
-            .fg(Color::White)
-            .bg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD),
-    );
-    f.render_widget(topbar, root[0]);
-
-    let body = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(34), Constraint::Percentage(66)])
-        .split(root[1]);
-
-    let core_panel_height = (app.cpu_count as u16 + 3).clamp(6, 14);
-    let left_panels = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(5),
-            Constraint::Length(core_panel_height),
-            Constraint::Length(4),
-            Constraint::Length(4),
-            Constraint::Length(4),
-            Constraint::Min(0),
-        ])
-        .split(body[0]);
-
-    f.render_widget(Clear, left_panels[0]);
-    let cpu_panel = LineGauge::default()
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" CPU (all cores) ")
-                .border_style(Style::default().fg(Color::Cyan)),
-        )
-        .filled_style(Style::default().fg(Color::LightGreen))
-        .filled_symbol(symbols::line::THICK_HORIZONTAL)
-        .ratio((cpu_usage as f64 / 100.0).clamp(0.0, 1.0));
-    f.render_widget(cpu_panel, left_panels[0]);
-
-    let cpu_points: Vec<u64> = app.cpu_history.iter().copied().collect();
-    let usage_bar = |usage: f32, width: usize| -> String {
-        let filled = ((usage.clamp(0.0, 100.0) / 100.0) * width as f32).round() as usize;
-        format!(
-            "{}{}",
-            "#".repeat(filled.min(width)),
-            ".".repeat(width.saturating_sub(filled))
-        )
-    };
     let load = System::load_average();
-    let mut core_lines = Vec::with_capacity(app.core_usages.len() + 2);
-    core_lines.push(format!(
-        "overall {:>5.1}% ({} cores)",
+    let refresh_ms = app.tick_rate.as_millis().min(9999);
+
+    let top_block = Block::default()
+        .borders(Borders::ALL)
+        .title("1 cpu menu preset *")
+        .border_style(Style::default().fg(Color::DarkGray));
+    f.render_widget(Clear, root[0]);
+    f.render_widget(top_block.clone(), root[0]);
+    let top_inner = top_block.inner(root[0]);
+    let uptime = System::uptime();
+    f.render_widget(
+        Paragraph::new(format!("up {}h {}m", uptime / 3600, (uptime % 3600) / 60))
+            .style(Style::default().fg(Color::Gray)),
+        top_inner,
+    );
+
+    let mini = Rect {
+        x: top_inner.x + top_inner.width.saturating_sub(top_inner.width.min(38)),
+        y: top_inner.y + top_inner.height.saturating_sub(top_inner.height.min(9)),
+        width: top_inner.width.min(38),
+        height: top_inner.height.min(9),
+    };
+    f.render_widget(Clear, mini);
+    let mini_block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!("{}ms", refresh_ms))
+        .border_style(Style::default().fg(Color::DarkGray));
+    let mini_inner = mini_block.inner(mini);
+    f.render_widget(mini_block, mini);
+    let mut lines = vec![format!(
+        "CPU {:>5.1}%  ({} cores)",
         cpu_usage, app.cpu_count
-    ));
-    for (i, usage) in app.core_usages.iter().enumerate() {
-        core_lines.push(format!(
-            "C{:<2} {} {:>5.1}%",
-            i,
-            usage_bar(*usage, 10),
-            usage
-        ));
+    )];
+    for (i, u) in app.core_usages.iter().enumerate() {
+        lines.push(format!("C{:<2} {:>5.1}%", i, u));
     }
-    core_lines.push(format!(
-        "load avg {:.2} {:.2} {:.2}",
+    lines.push(format!(
+        "Load AVG {:>4.2} {:>4.2} {:>4.2}",
         load.one, load.five, load.fifteen
     ));
-    let cpu_details = Paragraph::new(format!("{}", core_lines.join("\n")))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Cores ")
-                .border_style(Style::default().fg(Color::Cyan)),
-        )
-        .style(Style::default().fg(Color::White));
-    f.render_widget(Clear, left_panels[1]);
-    f.render_widget(cpu_details, left_panels[1]);
+    f.render_widget(
+        Paragraph::new(lines.join("\n")).style(Style::default().fg(Color::White)),
+        mini_inner,
+    );
+
+    let lower = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .split(root[1]);
+    let left = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(11), Constraint::Min(8)])
+        .split(lower[0]);
+    let upper_left = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(53), Constraint::Percentage(47)])
+        .split(left[0]);
+    let lower_left = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .split(left[1]);
 
     let total_mem = app.system.total_memory();
     let used_mem = app.system.used_memory();
     let total_swap = app.system.total_swap();
     let used_swap = app.system.used_swap();
-    let mem_ratio = if total_mem > 0 {
-        used_mem as f64 / total_mem as f64
-    } else {
-        0.0
-    };
-    let swap_ratio = if total_swap > 0 {
-        used_swap as f64 / total_swap as f64
-    } else {
-        0.0
-    };
-    let mem_panel = Gauge::default()
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Memory (RAM) ")
-                .border_style(Style::default().fg(Color::Green)),
-        )
-        .gauge_style(Style::default().fg(Color::Green))
-        .label(format!(
-            " {:.2}/{:.2} GiB ({:.1}%) ",
-            used_mem as f64 / 1_073_741_824.0,
-            total_mem as f64 / 1_073_741_824.0,
-            mem_ratio * 100.0
+    let avail_mem = app.system.available_memory();
+    let free_mem = app.system.free_memory();
+
+    f.render_widget(Clear, upper_left[0]);
+    let mem_block = Block::default()
+        .borders(Borders::ALL)
+        .title("2 mem")
+        .border_style(Style::default().fg(Color::Blue));
+    let mem_inner = mem_block.inner(upper_left[0]);
+    f.render_widget(mem_block, upper_left[0]);
+    f.render_widget(
+        Paragraph::new(format!(
+            "Total: {:>7.2} GiB\nUsed:  {:>7.2} GiB  {:>4.0}%\nAvail: {:>7.2} GiB  {:>4.0}%\nFree:  {:>7.2} GiB  {:>4.0}%",
+            gib(total_mem),
+            gib(used_mem),
+            pct(used_mem, total_mem),
+            gib(avail_mem),
+            pct(avail_mem, total_mem),
+            gib(free_mem),
+            pct(free_mem, total_mem),
         ))
-        .ratio(mem_ratio.clamp(0.0, 1.0));
-    f.render_widget(Clear, left_panels[2]);
-    f.render_widget(mem_panel, left_panels[2]);
+        .style(Style::default().fg(Color::White)),
+        mem_inner,
+    );
 
-    let swap_panel = Gauge::default()
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Swap ")
-                .border_style(Style::default().fg(Color::LightBlue)),
-        )
-        .gauge_style(Style::default().fg(Color::LightBlue))
-        .label(format!(
-            " {:.2}/{:.2} GiB ({:.1}%) ",
-            used_swap as f64 / 1_073_741_824.0,
-            total_swap as f64 / 1_073_741_824.0,
-            swap_ratio * 100.0
+    f.render_widget(Clear, upper_left[1]);
+    let disks_block = Block::default()
+        .borders(Borders::ALL)
+        .title("disks")
+        .border_style(Style::default().fg(Color::Yellow));
+    let disks_inner = disks_block.inner(upper_left[1]);
+    f.render_widget(disks_block, upper_left[1]);
+    f.render_widget(
+        Paragraph::new(format!(
+            "root\nUsed: {:>4.0}%\nFree: {:>4.0}%\nswap\nUsed: {:>4.0}%\nFree: {:>4.0}%",
+            pct(used_mem, total_mem),
+            100.0 - pct(used_mem, total_mem),
+            pct(used_swap, total_swap),
+            100.0 - pct(used_swap, total_swap),
         ))
-        .ratio(swap_ratio.clamp(0.0, 1.0));
-    f.render_widget(Clear, left_panels[3]);
-    f.render_widget(swap_panel, left_panels[3]);
+        .style(Style::default().fg(Color::White)),
+        disks_inner,
+    );
 
-    let filter_title = match app.input_mode {
-        InputMode::Normal => " Filter ",
-        InputMode::Filter => " Filter (typing) ",
-    };
-    let filter_text = if app.filter_query.is_empty() {
-        String::from(" / to search process names, x to clear ")
-    } else {
-        format!(" {} ", app.filter_query)
-    };
-    let cpu_sparkline = Sparkline::default()
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" CPU Trend ")
-                .border_style(Style::default().fg(Color::LightBlue)),
-        )
-        .style(Style::default().fg(Color::Yellow))
-        .max(100)
-        .data(&cpu_points);
-    f.render_widget(Clear, left_panels[4]);
-    f.render_widget(cpu_sparkline, left_panels[4]);
+    f.render_widget(Clear, lower_left[0]);
+    f.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("3 net")
+            .border_style(Style::default().fg(Color::Blue)),
+        lower_left[0],
+    );
 
-    let filter_panel = Paragraph::new(filter_text)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(filter_title)
-                .border_style(Style::default().fg(Color::LightBlue)),
-        )
-        .style(Style::default().fg(Color::White));
-    f.render_widget(Clear, left_panels[5]);
-    f.render_widget(filter_panel, left_panels[5]);
+    f.render_widget(Clear, lower_left[1]);
+    let sync_block = Block::default()
+        .borders(Borders::ALL)
+        .title("sync auto zero")
+        .border_style(Style::default().fg(Color::Blue));
+    let sync_inner = sync_block.inner(lower_left[1]);
+    f.render_widget(sync_block, lower_left[1]);
+    f.render_widget(
+        Paragraph::new(format!(
+            "download\n0 B/s\n\nupload\n0 B/s\n\nfilter: {}",
+            if app.filter_query.is_empty() {
+                "<none>".to_string()
+            } else {
+                app.filter_query.clone()
+            }
+        ))
+        .style(Style::default().fg(Color::White)),
+        sync_inner,
+    );
 
-    let table_visible_rows = body[1].height.saturating_sub(3) as usize;
+    let proc_area = lower[1];
+    let table_visible_rows = proc_area.height.saturating_sub(3) as usize;
     app.align_scroll_to_selection(table_visible_rows);
-
     let start = app.process_scroll.min(app.process_count());
     let end = (start + table_visible_rows).min(app.process_count());
 
     let header = Row::new(
-        ["Pid", "Program", "Cpu% (all)", "Mem%"]
+        ["Pid", "Program", "Mem%", "Cpu%"]
             .into_iter()
             .map(Cell::from),
     )
     .style(
         Style::default()
             .fg(Color::White)
-            .bg(Color::DarkGray)
             .add_modifier(Modifier::BOLD),
     );
-
     let rows = app.process_rows[start..end]
         .iter()
         .enumerate()
         .map(|(i, p)| {
             let absolute_index = start + i;
-            let mut base_style = if i % 2 == 0 {
+            let mut row_style = if i % 2 == 0 {
                 Style::default().fg(Color::Gray)
             } else {
                 Style::default().fg(Color::White)
             };
             if absolute_index == app.selected_process {
-                base_style = Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD);
+                row_style = Style::default().fg(Color::Black).bg(Color::Yellow);
             }
-
-            let cpu_style = if p.cpu_total_percent >= 40.0 {
-                Style::default().fg(Color::Red)
-            } else if p.cpu_total_percent >= 15.0 {
-                Style::default().fg(Color::Yellow)
-            } else {
-                Style::default().fg(Color::LightGreen)
-            };
-
             Row::new(vec![
                 Cell::from(p.pid.clone()),
                 Cell::from(p.name.clone()),
-                Cell::from(format!("{:>7.1}", p.cpu_total_percent)).style(cpu_style),
                 Cell::from(format!("{:>5.1}", p.mem_percent)),
+                Cell::from(format!("{:>5.1}", p.cpu_total_percent)),
             ])
-            .style(base_style)
+            .style(row_style)
         });
-
-    let process_title = format!(
-        " Processes [{}/{}] ",
-        if app.process_count() == 0 {
-            0
-        } else {
-            app.selected_process + 1
-        },
-        app.process_count()
-    );
 
     let table = Table::new(
         rows,
         [
-            Constraint::Percentage(14),
-            Constraint::Percentage(54),
             Constraint::Percentage(18),
-            Constraint::Percentage(14),
+            Constraint::Percentage(50),
+            Constraint::Percentage(16),
+            Constraint::Percentage(16),
         ],
     )
     .header(header)
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(process_title)
-            .border_style(Style::default().fg(Color::Magenta)),
+            .title(format!(
+                "4 proc filter <{}>",
+                if app.filter_query.is_empty() {
+                    "none".to_string()
+                } else {
+                    app.filter_query.clone()
+                }
+            ))
+            .border_style(Style::default().fg(Color::Red)),
     );
+    f.render_widget(Clear, proc_area);
+    f.render_widget(table, proc_area);
 
-    f.render_widget(Clear, body[1]);
-    f.render_widget(table, body[1]);
+    f.render_widget(
+        Paragraph::new(
+            " q/Ctrl+C quit | j/k/PgUp/PgDn/Home/End move | / filter | x clear | s sort | r reverse | c/m/p/n | +/- refresh ",
+        )
+        .style(Style::default().fg(Color::DarkGray)),
+        root[2],
+    );
+}
 
-    let mode = match app.input_mode {
-        InputMode::Normal => "normal",
-        InputMode::Filter => "filter",
-    };
-    let footer = Paragraph::new(format!(
-        " mode {} | q/Ctrl+C quit | j/k PgUp/PgDn Home/End move | / filter, x clear | s cycle-sort | c/m/p/n sort | r reverse | +/- refresh ",
-        mode
-    ))
-    .style(Style::default().fg(Color::DarkGray));
-    f.render_widget(footer, root[2]);
+fn gib(bytes: u64) -> f64 {
+    bytes as f64 / 1_073_741_824.0
+}
+
+fn pct(part: u64, total: u64) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        (part as f64 / total as f64 * 100.0).clamp(0.0, 100.0)
+    }
 }
