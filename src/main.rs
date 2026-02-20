@@ -49,6 +49,7 @@ struct ProcessRowData {
     name: String,
     cpu_total_percent: f32,
     mem_percent: f64,
+    mem_bytes: u64,
 }
 
 enum InputMode {
@@ -122,6 +123,7 @@ impl App {
                 name: p.name().to_string_lossy().into_owned(),
                 cpu_total_percent: (p.cpu_usage() / self.cpu_count as f32).clamp(0.0, 100.0),
                 mem_percent: (p.memory() as f64 / total_mem * 100.0).clamp(0.0, 100.0),
+                mem_bytes: p.memory(),
             })
             .collect();
 
@@ -405,7 +407,7 @@ fn ui(f: &mut Frame, app: &mut App) {
     f.render_widget(Clear, mini);
     let mini_block = Block::default()
         .borders(Borders::ALL)
-        .title(format!("{}ms", refresh_ms))
+        .title(format!("{}ms +", refresh_ms))
         .border_style(Style::default().fg(Color::DarkGray));
     let mini_inner = mini_block.inner(mini);
     f.render_widget(mini_block, mini);
@@ -452,7 +454,7 @@ fn ui(f: &mut Frame, app: &mut App) {
     f.render_widget(Clear, upper_left[0]);
     let mem_block = Block::default()
         .borders(Borders::ALL)
-        .title("2 mem")
+        .title("Memory Pressure")
         .border_style(Style::default().fg(Color::Blue));
     let mem_inner = mem_block.inner(upper_left[0]);
     f.render_widget(mem_block, upper_left[0]);
@@ -502,7 +504,7 @@ fn ui(f: &mut Frame, app: &mut App) {
     f.render_widget(Clear, lower_left[1]);
     let sync_block = Block::default()
         .borders(Borders::ALL)
-        .title("sync auto zero")
+        .title("sync auto zero <b eth0 n>")
         .border_style(Style::default().fg(Color::Blue));
     let sync_inner = sync_block.inner(lower_left[1]);
     f.render_widget(sync_block, lower_left[1]);
@@ -526,7 +528,7 @@ fn ui(f: &mut Frame, app: &mut App) {
     let end = (start + table_visible_rows).min(app.process_count());
 
     let header = Row::new(
-        ["Pid", "Program", "Mem%", "Cpu%"]
+        ["Pid", "Program", "MemB", "Cpu%"]
             .into_iter()
             .map(Cell::from),
     )
@@ -551,7 +553,7 @@ fn ui(f: &mut Frame, app: &mut App) {
             Row::new(vec![
                 Cell::from(p.pid.clone()),
                 Cell::from(p.name.clone()),
-                Cell::from(format!("{:>5.1}", p.mem_percent)),
+                Cell::from(format!("{:>6}", human_bytes(p.mem_bytes))),
                 Cell::from(format!("{:>5.1}", p.cpu_total_percent)),
             ])
             .style(row_style)
@@ -571,7 +573,7 @@ fn ui(f: &mut Frame, app: &mut App) {
         Block::default()
             .borders(Borders::ALL)
             .title(format!(
-                "4 proc filter <{}>",
+                "4 proc filter per-core reverse tree < cpu Lazy > [{}]",
                 if app.filter_query.is_empty() {
                     "none".to_string()
                 } else {
@@ -601,5 +603,21 @@ fn pct(part: u64, total: u64) -> f64 {
         0.0
     } else {
         (part as f64 / total as f64 * 100.0).clamp(0.0, 100.0)
+    }
+}
+
+fn human_bytes(b: u64) -> String {
+    let kib = 1024.0;
+    let mib = kib * 1024.0;
+    let gib = mib * 1024.0;
+    let bf = b as f64;
+    if bf >= gib {
+        format!("{:.1}G", bf / gib)
+    } else if bf >= mib {
+        format!("{:.0}M", bf / mib)
+    } else if bf >= kib {
+        format!("{:.0}K", bf / kib)
+    } else {
+        format!("{}B", b)
     }
 }
