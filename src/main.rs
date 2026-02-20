@@ -70,6 +70,7 @@ impl SortMode {
 struct ProcessRowData {
     pid: String,
     pid_num: u32,
+    parent_pid: Option<u32>,
     name: String,
     name_lc: String,
     command: String,
@@ -240,6 +241,7 @@ impl App {
                     ProcessRowData {
                         pid: p.pid().to_string(),
                         pid_num: p.pid().as_u32(),
+                        parent_pid: p.parent().map(|pp| pp.as_u32()),
                         name_lc: name.to_lowercase(),
                         name,
                         command: p
@@ -323,18 +325,28 @@ impl App {
             .cloned()
             .collect();
 
-        rows.sort_by(|a, b| match self.sort_mode {
-            SortMode::Cpu => b
-                .display_cpu(self.per_core)
-                .total_cmp(&a.display_cpu(self.per_core))
-                .then_with(|| b.mem_percent.total_cmp(&a.mem_percent)),
-            SortMode::Mem => b
-                .mem_percent
-                .total_cmp(&a.mem_percent)
-                .then_with(|| b.cpu_total_percent.total_cmp(&a.cpu_total_percent)),
-            SortMode::Pid => a.pid_num.cmp(&b.pid_num),
-            SortMode::Name => a.name.cmp(&b.name),
-        });
+        if self.tree_mode {
+            rows.sort_by(|a, b| {
+                a.parent_pid
+                    .unwrap_or(a.pid_num)
+                    .cmp(&b.parent_pid.unwrap_or(b.pid_num))
+                    .then_with(|| a.parent_pid.is_some().cmp(&b.parent_pid.is_some()))
+                    .then_with(|| a.pid_num.cmp(&b.pid_num))
+            });
+        } else {
+            rows.sort_by(|a, b| match self.sort_mode {
+                SortMode::Cpu => b
+                    .display_cpu(self.per_core)
+                    .total_cmp(&a.display_cpu(self.per_core))
+                    .then_with(|| b.mem_percent.total_cmp(&a.mem_percent)),
+                SortMode::Mem => b
+                    .mem_percent
+                    .total_cmp(&a.mem_percent)
+                    .then_with(|| b.cpu_total_percent.total_cmp(&a.cpu_total_percent)),
+                SortMode::Pid => a.pid_num.cmp(&b.pid_num),
+                SortMode::Name => a.name.cmp(&b.name),
+            });
+        }
 
         if self.sort_reverse {
             rows.reverse();
@@ -994,7 +1006,11 @@ fn ui(f: &mut Frame, app: &mut App) {
             };
             Row::new(vec![
                 Cell::from(p.pid.clone()),
-                Cell::from(p.name.clone()),
+                Cell::from(if app.tree_mode && p.parent_pid.is_some() {
+                    format!("└ {}", p.name)
+                } else {
+                    p.name.clone()
+                }),
                 Cell::from(if p.command.is_empty() {
                     p.name.clone()
                 } else {
