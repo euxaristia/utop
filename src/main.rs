@@ -445,8 +445,15 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     let total_mem = app.system.total_memory();
     let used_mem = app.system.used_memory();
+    let total_swap = app.system.total_swap();
+    let used_swap = app.system.used_swap();
     let mem_ratio = if total_mem > 0 {
         used_mem as f64 / total_mem as f64
+    } else {
+        0.0
+    };
+    let swap_ratio = if total_swap > 0 {
+        used_swap as f64 / total_swap as f64
     } else {
         0.0
     };
@@ -459,10 +466,13 @@ fn ui(f: &mut Frame, app: &mut App) {
         )
         .gauge_style(Style::default().fg(Color::Green))
         .label(format!(
-            " {:.2} / {:.2} GiB ({:.1}%) ",
+            " RAM {:.2}/{:.2} GiB ({:.1}%) | SWAP {:.2}/{:.2} GiB ({:.1}%) ",
             used_mem as f64 / 1_073_741_824.0,
             total_mem as f64 / 1_073_741_824.0,
-            mem_ratio * 100.0
+            mem_ratio * 100.0,
+            used_swap as f64 / 1_073_741_824.0,
+            total_swap as f64 / 1_073_741_824.0,
+            swap_ratio * 100.0
         ))
         .ratio(mem_ratio.clamp(0.0, 1.0));
     f.render_widget(mem_panel, left_panels[2]);
