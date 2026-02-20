@@ -17,7 +17,9 @@ use std::{
     path::Path,
     time::{Duration, Instant},
 };
-use sysinfo::{Disks, Networks, System};
+use sysinfo::{
+    CpuRefreshKind, Disks, Networks, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind,
+};
 
 const MAX_CPU_HISTORY: usize = 240;
 const MIN_TICK_MS: u64 = 200;
@@ -85,6 +87,7 @@ struct App {
     net_tx_top: f64,
     net_rx_total: u64,
     net_tx_total: u64,
+    last_disk_refresh: Instant,
 }
 
 impl App {
@@ -113,6 +116,7 @@ impl App {
             net_tx_top: 0.0,
             net_rx_total: 0,
             net_tx_total: 0,
+            last_disk_refresh: Instant::now(),
         };
         app.update();
         app
@@ -120,8 +124,23 @@ impl App {
 
     fn update(&mut self) {
         let elapsed = self.last_tick.elapsed().as_secs_f64().max(0.001);
-        self.system.refresh_all();
-        self.disks.refresh(true);
+        self.system
+            .refresh_cpu_specifics(CpuRefreshKind::nothing().with_cpu_usage());
+        self.system.refresh_memory();
+        self.system.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing()
+                .with_cpu()
+                .with_memory()
+                .with_user(UpdateKind::OnlyIfNotSet)
+                .with_cmd(UpdateKind::OnlyIfNotSet)
+                .without_tasks(),
+        );
+        if self.last_disk_refresh.elapsed() >= Duration::from_secs(5) {
+            self.disks.refresh(false);
+            self.last_disk_refresh = Instant::now();
+        }
         self.networks.refresh(true);
         self.cpu_count = self.system.cpus().len().max(1);
         self.core_usages = self
@@ -145,11 +164,12 @@ impl App {
             .map(|p| ProcessRowData {
                 pid: p.pid().to_string(),
                 pid_num: p.pid().as_u32(),
-                name: p.name().to_string_lossy().into_owned(),
+                name: trim_text(&p.name().to_string_lossy(), 18),
                 command: p
                     .cmd()
                     .iter()
-                    .map(|s| s.to_string_lossy())
+                    .take(4)
+                    .map(|s| s.to_string_lossy().to_string())
                     .collect::<Vec<_>>()
                     .join(" "),
                 user: p
@@ -162,6 +182,13 @@ impl App {
                 mem_bytes: p.memory(),
             })
             .collect();
+        for row in &mut self.all_process_rows {
+            if row.command.is_empty() {
+                row.command = row.name.clone();
+            } else {
+                row.command = trim_text(&row.command, 54);
+            }
+        }
 
         let selected = self
             .networks
@@ -809,6 +836,16 @@ fn rate_to_pct(current: f64, top: f64) -> f32 {
         0.0
     } else {
         ((current / top) * 100.0).clamp(0.0, 100.0) as f32
+    }
+}
+
+fn trim_text(s: &str, max_chars: usize) -> String {
+    let mut chars = s.chars();
+    let out: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{out}..")
+    } else {
+        out
     }
 }
 
