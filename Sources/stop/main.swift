@@ -69,6 +69,18 @@ struct NetworkSnapshot {
     let txRate: Double
 }
 
+struct GpuSnapshot {
+    let name: String
+    let usage: Double?      // 0-100%
+    let memUsed: UInt64?
+    let memTotal: UInt64?
+    
+    var memPercent: Double? {
+        guard let used = memUsed, let total = memTotal, total > 0 else { return nil }
+        return (Double(used) / Double(total)) * 100.0
+    }
+}
+
 enum SortMode {
     case cpu
     case memory
@@ -153,7 +165,10 @@ final class Sampler {
     private let pageSize: UInt64 = UInt64(max(1, sysconf(Int32(_SC_PAGESIZE))))
     private var cpuCount: Int = max(1, Foundation.ProcessInfo.processInfo.activeProcessorCount)
 
-    func sample(sortMode: SortMode, filter: String) -> (Double, MemorySnapshot, NetworkSnapshot, [ProcessInfo], Int) {
+    private var lastNvidiaSampleAt: Date = Date.distantPast
+    private var lastNvidiaGpu: GpuSnapshot?
+
+    func sample(sortMode: SortMode, filter: String) -> (Double, MemorySnapshot, NetworkSnapshot, GpuSnapshot?, [ProcessInfo], Int) {
         let now = Date()
         let elapsed = max(0.001, now.timeIntervalSince(lastSampleAt))
         lastSampleAt = now
@@ -162,9 +177,134 @@ final class Sampler {
         let (cpuPercent, delta) = computeCpuDelta(currentCpu)
         let memory = readMemory()
         let network = readNetwork(elapsed: elapsed)
+        let gpu = readGpu()
         let processes = readProcesses(cpuDeltaTotal: delta, sortMode: sortMode, filter: filter)
 
-        return (cpuPercent, memory, network, processes, cpuCount)
+        return (cpuPercent, memory, network, gpu, processes, cpuCount)
+    }
+
+    private func readGpu() -> GpuSnapshot? {
+        // 1. Check for AMD / DRM / generic sysfs percentage
+        if let dir = opendir("/sys/class/drm") {
+            defer { closedir(dir) }
+            while let entry = readdir(dir) {
+                let name = withUnsafePointer(to: entry.pointee.d_name) { ptr in
+                    String(cString: UnsafeRawPointer(ptr).assumingMemoryBound(to: CChar.self))
+                }
+                if name.hasPrefix("card") && !name.hasSuffix("-") {
+                    let cardPath = "/sys/class/drm/\(name)"
+                    let devicePath = "\(cardPath)/device"
+                    
+                    // Try various usage paths
+                    var usage: Double?
+                    let usagePaths = [
+                        "\(devicePath)/gpu_busy_percent", // AMD, RPi
+                        "\(cardPath)/gt/gt0/usage",      // Intel (newer)
+                        "\(devicePath)/usage"            // Generic
+                    ]
+                    
+                    for p in usagePaths {
+                        if let valStr = try? String(contentsOfFile: p, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+                           let u = Double(valStr) {
+                            usage = u
+                            break
+                        }
+                    }
+                    
+                    if usage != nil {
+                        let vendorPath = "\(devicePath)/vendor"
+                        let vendor = (try? String(contentsOfFile: vendorPath, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                        
+                        var nameStr = "GPU"
+                        if vendor == "0x1002" { nameStr = "AMD GPU" }
+                        else if vendor == "0x8086" { nameStr = "Intel GPU" }
+                        else if vendor == "0x10de" { nameStr = "NVIDIA GPU" }
+                        
+                        // Try to get VRAM
+                        var usedVram: UInt64?
+                        var totalVram: UInt64?
+                        
+                        // AMD specific
+                        if let uStr = try? String(contentsOfFile: "\(devicePath)/mem_info_vram_used", encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+                           let u = UInt64(uStr) {
+                            usedVram = u
+                        }
+                        if let tStr = try? String(contentsOfFile: "\(devicePath)/mem_info_vram_total", encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+                           let t = UInt64(tStr) {
+                            totalVram = t
+                        }
+                        
+                        // Intel specific (xe driver / newer)
+                        if usedVram == nil {
+                            if let uStr = try? String(contentsOfFile: "\(cardPath)/tile0/vram0/used", encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+                               let u = UInt64(uStr) {
+                                usedVram = u
+                            }
+                            if let tStr = try? String(contentsOfFile: "\(cardPath)/tile0/vram0/size", encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+                               let t = UInt64(tStr) {
+                                totalVram = t
+                            }
+                        }
+                        
+                        return GpuSnapshot(name: nameStr, usage: usage, memUsed: usedVram, memTotal: totalVram)
+                    }
+                }
+            }
+        }
+        
+        // 2. Adreno / kgsl (Android/Linux handhelds)
+        let adrenoPaths = [
+            "/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage",
+            "/sys/class/kgsl/kgsl-3d0/gpubusy"
+        ]
+        for p in adrenoPaths {
+            if let valStr = try? String(contentsOfFile: p, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines) {
+                let usage: Double?
+                if p.contains("gpubusy") {
+                    // gpubusy often returns "busy_ticks total_ticks"
+                    let parts = valStr.split(separator: " ").compactMap { Double($0) }
+                    if parts.count >= 2 && parts[1] > 0 {
+                        usage = (parts[0] / parts[1]) * 100.0
+                    } else { usage = nil }
+                } else {
+                    usage = Double(valStr)
+                }
+                
+                if let u = usage {
+                    return GpuSnapshot(name: "Adreno GPU", usage: u, memUsed: nil, memTotal: nil)
+                }
+            }
+        }
+        
+        // 3. NVIDIA via nvidia-smi (as a fallback since it's not in sysfs)
+        let now = Date()
+        if now.timeIntervalSince(lastNvidiaSampleAt) >= 1.0 {
+            lastNvidiaSampleAt = now
+            let pipe = Pipe()
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/nvidia-smi")
+            process.arguments = ["--query-gpu=utilization.gpu,memory.used,memory.total", "--format=csv,noheader,nounits"]
+            process.standardOutput = pipe
+            
+            do {
+                try process.run()
+                process.waitUntilExit()
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                if let output = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) {
+                    let parts = output.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+                    if parts.count >= 3 {
+                        let usage = Double(parts[0])
+                        let used = UInt64(parts[1]).map { $0 * 1024 * 1024 } // MiB to bytes
+                        let total = UInt64(parts[2]).map { $0 * 1024 * 1024 } // MiB to bytes
+                        lastNvidiaGpu = GpuSnapshot(name: "NVIDIA GPU", usage: usage, memUsed: used, memTotal: total)
+                    }
+                }
+            } catch {
+                // nvidia-smi likely not found or failed
+            }
+        }
+        
+        return lastNvidiaGpu
     }
 
     private func computeCpuDelta(_ current: CpuTimes?) -> (Double, UInt64) {
@@ -431,6 +571,7 @@ func render(
     cpu: Double,
     memory: MemorySnapshot,
     network: NetworkSnapshot,
+    gpu: GpuSnapshot?,
     processes: [ProcessInfo],
     selected: Int,
     cpuCount: Int,
@@ -439,7 +580,7 @@ func render(
     isSearching: Bool
 ) {
     let size = termSize()
-    let headerLines = 8
+    let headerLines = 9
     let tableStart = headerLines + 2
     let visibleRows = max(5, size.rows - tableStart - 2)
 
@@ -472,6 +613,18 @@ func render(
     appendLine(&out, "stop (pure Swift, no libs)    CPUs: \(cpuCount)")
     appendLine(&out, "CPU: \(String(format: "%5.1f", cpu))%")
     appendLine(&out, "MEM: \(String(format: "%5.1f", memory.usedPercent))%  \(humanBytes(memory.usedBytes)) / \(humanBytes(memory.totalBytes))")
+    
+    if let g = gpu {
+        let usageStr = g.usage.map { String(format: "%5.1f%%", $0) } ?? " - %"
+        var vramStr = ""
+        if let used = g.memUsed, let total = g.memTotal {
+            vramStr = "  VRAM: \(humanBytes(used)) / \(humanBytes(total))"
+        }
+        appendLine(&out, "\(g.name): \(usageStr)\(vramStr)")
+    } else {
+        appendLine(&out, "GPU: - %")
+    }
+
     appendLine(&out, "NET: \(network.iface)  rx \(humanBytes(UInt64(network.rxRate)))/s  tx \(humanBytes(UInt64(network.txRate)))/s")
     appendLine(&out, "Controls: q quit, j/k/arrows move, h/l/arrows sort, / search")
     if isSearching {
@@ -617,14 +770,14 @@ while running {
         if isSearching || filter != "" || sortMode != .cpu { // Rough check if we need to re-sample immediately
              latest = sampler.sample(sortMode: sortMode, filter: filter)
         }
-        selected = clamp(selected, 0, max(0, latest.3.count - 1))
+        selected = clamp(selected, 0, max(0, latest.4.count - 1))
         needsRender = true
     }
 
     let nowPostPoll = Date()
     if nowPostPoll >= nextSample {
         latest = sampler.sample(sortMode: sortMode, filter: filter)
-        selected = clamp(selected, 0, max(0, latest.3.count - 1))
+        selected = clamp(selected, 0, max(0, latest.4.count - 1))
         needsRender = true
         nextSample = nowPostPoll.addingTimeInterval(sampleInterval)
     }
@@ -634,9 +787,10 @@ while running {
             cpu: latest.0,
             memory: latest.1,
             network: latest.2,
-            processes: latest.3,
+            gpu: latest.3,
+            processes: latest.4,
             selected: selected,
-            cpuCount: latest.4,
+            cpuCount: latest.5,
             sortMode: sortMode,
             filter: filter,
             isSearching: isSearching
