@@ -96,12 +96,6 @@ final class TerminalRawMode {
         var raw = original
         // Keep control in-process so normal teardown always restores cursor/tty.
         raw.c_lflag &= ~tcflag_t(ECHO | ICANON | ISIG)
-        withUnsafeMutablePointer(to: &raw.c_cc) { ptr in
-            let cc = UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: cc_t.self)
-            cc[Int(VMIN)] = 0
-            cc[Int(VTIME)] = 0
-        }
-
         if tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) != 0 { return nil }
         if fcntl(STDIN_FILENO, F_SETFL, originalFlags | O_NONBLOCK) == -1 {
             var restore = original
