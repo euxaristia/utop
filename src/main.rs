@@ -157,6 +157,9 @@ struct App {
     avg_freq_mhz: u64,
     load_avg: LoadAvg,
     uptime_secs: u64,
+    last_input: Instant,
+    perf_update_ms_ema: f64,
+    perf_draw_ms_ema: f64,
 }
 
 impl App {
@@ -207,6 +210,9 @@ impl App {
                 fifteen: 0.0,
             },
             uptime_secs: 0,
+            last_input: Instant::now(),
+            perf_update_ms_ema: 0.0,
+            perf_draw_ms_ema: 0.0,
         };
         app.update();
         app
@@ -218,9 +224,12 @@ impl App {
             .refresh_cpu_specifics(CpuRefreshKind::nothing().with_cpu_usage());
         self.system.refresh_memory();
         let process_interval = if self.proc_lazy { 1500 } else { 600 };
+        let recent_input = self.last_input.elapsed() < Duration::from_millis(300);
+        let max_staleness = Duration::from_secs(5);
         let mut process_refreshed = false;
         if self.all_process_rows.is_empty()
-            || self.last_process_refresh.elapsed() >= Duration::from_millis(process_interval)
+            || (self.last_process_refresh.elapsed() >= Duration::from_millis(process_interval)
+                && (!recent_input || self.last_process_refresh.elapsed() >= max_staleness))
         {
             self.system.refresh_processes_specifics(
                 ProcessesToUpdate::All,
@@ -712,6 +721,7 @@ where
         if event::poll(timeout)? {
             loop {
                 if let Event::Key(key) = event::read()? {
+                    app.last_input = Instant::now();
                     if app.modal.is_some() {
                         app.handle_modal_key(key.code);
                     } else {
@@ -773,12 +783,18 @@ where
         }
 
         if app.last_tick.elapsed() >= app.tick_rate {
+            let update_started = Instant::now();
             app.update();
+            let update_ms = update_started.elapsed().as_secs_f64() * 1000.0;
+            app.perf_update_ms_ema = ema(app.perf_update_ms_ema, update_ms, 0.2);
             app.last_tick = Instant::now();
         }
 
         if app.dirty && last_draw.elapsed() >= frame_budget {
+            let draw_started = Instant::now();
             terminal.draw(|f| ui(f, app))?;
+            let draw_ms = draw_started.elapsed().as_secs_f64() * 1000.0;
+            app.perf_draw_ms_ema = ema(app.perf_draw_ms_ema, draw_ms, 0.2);
             app.dirty = false;
             last_draw = Instant::now();
         }
@@ -1033,11 +1049,13 @@ fn ui(f: &mut Frame, app: &mut App) {
             human_rate(app.net_tx_top),
             human_bytes(app.net_tx_total),
             format!(
-                "sort={} rev={} tree={} lazy={}",
+                "sort={} rev={} tree={} lazy={} upd={:.1}ms draw={:.1}ms",
                 sort_name(app.sort_mode),
                 if app.sort_reverse { "on" } else { "off" },
                 if app.tree_mode { "on" } else { "off" },
-                if app.proc_lazy { "on" } else { "off" }
+                if app.proc_lazy { "on" } else { "off" },
+                app.perf_update_ms_ema,
+                app.perf_draw_ms_ema
             ),
         ))
         .style(Style::default().fg(Color::White)),
@@ -1449,5 +1467,13 @@ fn human_bytes(b: u64) -> String {
         format!("{:.0}K", bf / kib)
     } else {
         format!("{}B", b)
+    }
+}
+
+fn ema(current: f64, sample: f64, alpha: f64) -> f64 {
+    if current <= 0.0 {
+        sample
+    } else {
+        (alpha * sample) + ((1.0 - alpha) * current)
     }
 }
