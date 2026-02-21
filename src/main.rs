@@ -29,6 +29,7 @@ const MAX_NET_HISTORY: usize = 180;
 const MIN_TICK_MS: u64 = 200;
 const MAX_TICK_MS: u64 = 5000;
 const TICK_STEP_MS: u64 = 100;
+const MAX_FRAME_MS: u64 = 33;
 
 const SIGNAL_OPTIONS: [(&str, &str); 6] = [
     ("TERM", "-TERM"),
@@ -148,6 +149,8 @@ struct App {
     last_user_refresh: Instant,
     modal: Option<ModalState>,
     status_msg: String,
+    dirty: bool,
+    last_table_visible_rows: usize,
 }
 
 impl App {
@@ -189,6 +192,8 @@ impl App {
             last_user_refresh: Instant::now() - Duration::from_secs(30),
             modal: None,
             status_msg: String::new(),
+            dirty: true,
+            last_table_visible_rows: 24,
         };
         app.update();
         app
@@ -319,6 +324,7 @@ impl App {
             }
             self.last_ip_refresh = Instant::now();
         }
+        self.dirty = true;
     }
 
     fn rebuild_process_rows(&mut self) {
@@ -483,10 +489,12 @@ impl App {
     fn toggle_proc_lazy(&mut self) {
         self.proc_lazy = !self.proc_lazy;
         self.status_msg = format!("lazy {}", if self.proc_lazy { "on" } else { "off" });
+        self.dirty = true;
     }
 
     fn start_filter_input(&mut self) {
         self.input_mode = InputMode::Filter;
+        self.dirty = true;
     }
 
     fn clear_filter(&mut self) {
@@ -509,6 +517,7 @@ impl App {
             }
             _ => {}
         }
+        self.dirty = true;
     }
 
     fn selected_process_row(&self) -> Option<&ProcessRowData> {
@@ -526,6 +535,7 @@ impl App {
         } else {
             self.status_msg = "No process selected".to_string();
         }
+        self.dirty = true;
     }
 
     fn apply_signal(&mut self, pid: u32, signal_name: &str, signal_arg: &str) {
@@ -539,6 +549,7 @@ impl App {
             Err(e) => format!("Failed to send signal: {e}"),
         };
         self.update();
+        self.dirty = true;
     }
 
     fn handle_modal_key(&mut self, code: KeyCode) {
@@ -584,6 +595,7 @@ impl App {
                 },
             }
         }
+        self.dirty = true;
     }
 }
 
@@ -613,13 +625,21 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut A
 where
     B::Error: std::error::Error + Send + Sync + 'static,
 {
+    let frame_budget = Duration::from_millis(MAX_FRAME_MS);
+    let mut last_draw = Instant::now() - frame_budget;
     loop {
-        terminal.draw(|f| ui(f, app))?;
-
-        let timeout = app
+        let tick_timeout = app
             .tick_rate
             .checked_sub(app.last_tick.elapsed())
             .unwrap_or_else(|| Duration::from_secs(0));
+        let timeout = if app.dirty {
+            let frame_timeout = frame_budget
+                .checked_sub(last_draw.elapsed())
+                .unwrap_or_else(|| Duration::from_secs(0));
+            tick_timeout.min(frame_timeout)
+        } else {
+            tick_timeout
+        };
 
         if event::poll(timeout)? {
             loop {
@@ -630,7 +650,7 @@ where
                         match app.input_mode {
                             InputMode::Filter => app.handle_filter_key(key.code),
                             InputMode::Normal => {
-                                let page_size = terminal.size()?.height.saturating_sub(14) as usize;
+                                let page_size = app.last_table_visible_rows.max(1);
                                 match key.code {
                                     KeyCode::Char('q') => return Ok(()),
                                     KeyCode::Char('c')
@@ -674,6 +694,7 @@ where
                                     }
                                     _ => {}
                                 }
+                                app.dirty = true;
                             }
                         }
                     }
@@ -687,6 +708,12 @@ where
         if app.last_tick.elapsed() >= app.tick_rate {
             app.update();
             app.last_tick = Instant::now();
+        }
+
+        if app.dirty && last_draw.elapsed() >= frame_budget {
+            terminal.draw(|f| ui(f, app))?;
+            app.dirty = false;
+            last_draw = Instant::now();
         }
     }
 }
@@ -715,7 +742,6 @@ fn ui(f: &mut Frame, app: &mut App) {
         .borders(Borders::ALL)
         .title("┌1 cpu┐ ┌menu┐ ┌preset *┐")
         .border_style(Style::default().fg(Color::DarkGray));
-    f.render_widget(Clear, root[0]);
     f.render_widget(top_block.clone(), root[0]);
     let top_inner = top_block.inner(root[0]);
     let uptime = System::uptime();
@@ -763,7 +789,6 @@ fn ui(f: &mut Frame, app: &mut App) {
             graph,
         );
     }
-    f.render_widget(Clear, mini);
     let mini_block = Block::default()
         .borders(Borders::ALL)
         .title(format!("{}ms +", refresh_ms))
@@ -814,7 +839,6 @@ fn ui(f: &mut Frame, app: &mut App) {
     let used_swap = app.system.used_swap();
     let free_swap = app.system.free_swap();
 
-    f.render_widget(Clear, upper_left[0]);
     let mem_block = Block::default()
         .borders(Borders::ALL)
         .title("┌2 mem┐")
@@ -841,7 +865,6 @@ fn ui(f: &mut Frame, app: &mut App) {
         mem_inner,
     );
 
-    f.render_widget(Clear, upper_left[1]);
     let disks_block = Block::default()
         .borders(Borders::ALL)
         .title("┌disks┐")
@@ -881,13 +904,11 @@ fn ui(f: &mut Frame, app: &mut App) {
         disks_inner,
     );
 
-    f.render_widget(Clear, lower_left[0]);
     let net_block = Block::default()
         .borders(Borders::ALL)
         .title(format!("┌3 net┐ {} {}", app.net_iface, app.net_ip))
         .border_style(Style::default().fg(Color::Blue));
     let net_inner = net_block.inner(lower_left[0]);
-    f.render_widget(Clear, lower_left[0]);
     f.render_widget(net_block, lower_left[0]);
     let net_chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -931,7 +952,6 @@ fn ui(f: &mut Frame, app: &mut App) {
         net_chunks[2],
     );
 
-    f.render_widget(Clear, lower_left[1]);
     let sync_block = Block::default()
         .borders(Borders::ALL)
         .title("sync auto zero <b eth0 n>")
@@ -961,6 +981,7 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     let proc_area = lower[1];
     let table_visible_rows = proc_area.height.saturating_sub(3) as usize;
+    app.last_table_visible_rows = table_visible_rows.max(1);
     app.align_scroll_to_selection(table_visible_rows);
     let start = app.process_scroll.min(app.process_count());
     let end = (start + table_visible_rows).min(app.process_count());
@@ -1066,7 +1087,6 @@ fn ui(f: &mut Frame, app: &mut App) {
             ))
             .border_style(Style::default().fg(Color::Red)),
     );
-    f.render_widget(Clear, proc_area);
     f.render_widget(table, proc_area);
 
     let footer_left = match app.input_mode {
