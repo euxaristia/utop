@@ -13,7 +13,6 @@ use ratatui::{
 };
 use std::{
     collections::{HashMap, VecDeque},
-    fs,
     io,
     net::UdpSocket,
     path::Path,
@@ -21,7 +20,8 @@ use std::{
     time::{Duration, Instant},
 };
 use sysinfo::{
-    CpuRefreshKind, LoadAvg, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind,
+    CpuRefreshKind, Disks, LoadAvg, Networks, ProcessRefreshKind, ProcessesToUpdate, System,
+    UpdateKind,
 };
 
 const MAX_CPU_HISTORY: usize = 240;
@@ -90,23 +90,6 @@ struct ProcessRowData {
     cpu_cell_total: String,
 }
 
-#[derive(Clone)]
-struct DiskRow {
-    mount: String,
-    total: u64,
-    available: u64,
-}
-
-impl DiskRow {
-    fn total_space(&self) -> u64 {
-        self.total
-    }
-
-    fn available_space(&self) -> u64 {
-        self.available
-    }
-}
-
 impl ProcessRowData {
     fn display_cpu(&self, per_core: bool) -> f32 {
         if per_core {
@@ -136,7 +119,8 @@ enum ModalState {
 
 struct App {
     system: System,
-    disks: Vec<DiskRow>,
+    disks: Disks,
+    networks: Networks,
     last_tick: Instant,
     tick_rate: Duration,
     cpu_count: usize,
@@ -163,10 +147,6 @@ struct App {
     net_rx_history: VecDeque<u64>,
     net_tx_history: VecDeque<u64>,
     net_ip: String,
-    last_net_sample: Instant,
-    prev_net_iface: String,
-    prev_net_rx_total: u64,
-    prev_net_tx_total: u64,
     last_disk_refresh: Instant,
     last_process_refresh: Instant,
     last_ip_refresh: Instant,
@@ -187,7 +167,8 @@ impl App {
     fn new() -> Self {
         let mut app = Self {
             system: System::new_all(),
-            disks: read_disks_df(),
+            disks: Disks::new_with_refreshed_list(),
+            networks: Networks::new_with_refreshed_list(),
             last_tick: Instant::now(),
             tick_rate: Duration::from_millis(1000),
             cpu_count: 1,
@@ -214,10 +195,6 @@ impl App {
             net_rx_history: VecDeque::with_capacity(MAX_NET_HISTORY),
             net_tx_history: VecDeque::with_capacity(MAX_NET_HISTORY),
             net_ip: "-".to_string(),
-            last_net_sample: Instant::now(),
-            prev_net_iface: String::new(),
-            prev_net_rx_total: 0,
-            prev_net_tx_total: 0,
             last_disk_refresh: Instant::now(),
             last_process_refresh: Instant::now(),
             last_ip_refresh: Instant::now() - Duration::from_secs(30),
@@ -266,9 +243,10 @@ impl App {
             self.last_process_refresh = Instant::now();
         }
         if self.last_disk_refresh.elapsed() >= Duration::from_secs(5) {
-            self.disks = read_disks_df();
+            self.disks.refresh(false);
             self.last_disk_refresh = Instant::now();
         }
+        self.networks.refresh(true);
         self.cpu_count = self.system.cpus().len().max(1);
         self.core_usages = self
             .system
@@ -351,28 +329,21 @@ impl App {
             self.rebuild_process_rows();
         }
 
-        let now = Instant::now();
-        if let Some((name, rx_total, tx_total)) = read_primary_netdev(&self.net_iface) {
+        let selected = self
+            .networks
+            .iter()
+            .filter(|(name, _)| !name.starts_with("lo"))
+            .max_by_key(|(_, data)| data.total_received() + data.total_transmitted())
+            .or_else(|| self.networks.iter().next());
+        if let Some((name, data)) = selected {
             self.net_iface = name.clone();
-            let net_elapsed = now
-                .duration_since(self.last_net_sample)
-                .as_secs_f64()
-                .max(0.001);
-            if self.prev_net_iface == name {
-                self.net_rx_rate = rx_total.saturating_sub(self.prev_net_rx_total) as f64 / net_elapsed;
-                self.net_tx_rate = tx_total.saturating_sub(self.prev_net_tx_total) as f64 / net_elapsed;
-            } else {
-                self.net_rx_rate = 0.0;
-                self.net_tx_rate = 0.0;
-            }
-            self.prev_net_iface = name;
-            self.prev_net_rx_total = rx_total;
-            self.prev_net_tx_total = tx_total;
-            self.last_net_sample = now;
+            let elapsed = self.last_tick.elapsed().as_secs_f64().max(0.001);
+            self.net_rx_rate = data.received() as f64 / elapsed;
+            self.net_tx_rate = data.transmitted() as f64 / elapsed;
             self.net_rx_top = self.net_rx_top.max(self.net_rx_rate);
             self.net_tx_top = self.net_tx_top.max(self.net_tx_rate);
-            self.net_rx_total = rx_total;
-            self.net_tx_total = tx_total;
+            self.net_rx_total = data.total_received();
+            self.net_tx_total = data.total_transmitted();
             self.net_rx_history.push_back(self.net_rx_rate as u64);
             self.net_tx_history.push_back(self.net_tx_rate as u64);
             while self.net_rx_history.len() > MAX_NET_HISTORY {
@@ -970,6 +941,7 @@ fn ui(f: &mut Frame, app: &mut App) {
     f.render_widget(disks_block, upper_left[1]);
     let disk_lines = app
         .disks
+        .list()
         .iter()
         .take(4)
         .map(|disk| {
@@ -979,7 +951,7 @@ fn ui(f: &mut Frame, app: &mut App) {
             let used_pct = pct(used, total) as f32;
             format!(
                 "{}\nUsed:{:>4.0}% {:<14} {:>6.1}G\nFree:{:>4.0}% {:<14} {:>6.1}G",
-                disk.mount.as_str(),
+                friendly_mount(disk.mount_point()),
                 used_pct,
                 bar(used_pct, 10),
                 gib(used),
@@ -1489,67 +1461,6 @@ fn detect_local_ip() -> Option<String> {
     socket.connect("8.8.8.8:80").ok()?;
     let addr = socket.local_addr().ok()?;
     Some(addr.ip().to_string())
-}
-
-fn read_primary_netdev(preferred_iface: &str) -> Option<(String, u64, u64)> {
-    let data = fs::read_to_string("/proc/net/dev").ok()?;
-    let mut selected: Option<(String, u64, u64)> = None;
-    for line in data.lines().skip(2) {
-        let (iface_raw, rest) = line.split_once(':')?;
-        let iface = iface_raw.trim().to_string();
-        let fields: Vec<&str> = rest.split_whitespace().collect();
-        if fields.len() < 16 {
-            continue;
-        }
-        let Ok(rx) = fields[0].parse::<u64>() else {
-            continue;
-        };
-        let Ok(tx) = fields[8].parse::<u64>() else {
-            continue;
-        };
-        if !preferred_iface.is_empty() && preferred_iface != "-" && iface == preferred_iface {
-            return Some((iface, rx, tx));
-        }
-        if iface == "lo" {
-            continue;
-        }
-        match &selected {
-            Some((_, cur_rx, cur_tx)) if (*cur_rx + *cur_tx) >= (rx + tx) => {}
-            _ => selected = Some((iface, rx, tx)),
-        }
-    }
-    selected
-}
-
-fn read_disks_df() -> Vec<DiskRow> {
-    let output = Command::new("df").arg("-B1P").output();
-    let Ok(output) = output else {
-        return Vec::new();
-    };
-    if !output.status.success() {
-        return Vec::new();
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut rows = Vec::new();
-    for line in text.lines().skip(1) {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 6 {
-            continue;
-        }
-        let Ok(total) = parts[1].parse::<u64>() else {
-            continue;
-        };
-        let Ok(available) = parts[3].parse::<u64>() else {
-            continue;
-        };
-        let mount = parts[5].to_string();
-        rows.push(DiskRow {
-            mount: friendly_mount(Path::new(&mount)),
-            total,
-            available,
-        });
-    }
-    rows
 }
 
 fn gib(bytes: u64) -> f64 {
