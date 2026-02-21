@@ -69,6 +69,11 @@ struct NetworkSnapshot {
     let txRate: Double
 }
 
+enum SortMode {
+    case cpu
+    case memory
+}
+
 struct ProcessInfo {
     let pid: Int
     let name: String
@@ -81,6 +86,13 @@ enum Key {
     case quit
     case up
     case down
+    case left
+    case right
+    case search
+    case backspace
+    case enter
+    case esc
+    case char(Character)
 }
 
 final class TerminalRawMode {
@@ -141,7 +153,7 @@ final class Sampler {
     private let pageSize: UInt64 = UInt64(max(1, sysconf(Int32(_SC_PAGESIZE))))
     private var cpuCount: Int = max(1, Foundation.ProcessInfo.processInfo.activeProcessorCount)
 
-    func sample() -> (Double, MemorySnapshot, NetworkSnapshot, [ProcessInfo], Int) {
+    func sample(sortMode: SortMode, filter: String) -> (Double, MemorySnapshot, NetworkSnapshot, [ProcessInfo], Int) {
         let now = Date()
         let elapsed = max(0.001, now.timeIntervalSince(lastSampleAt))
         lastSampleAt = now
@@ -150,7 +162,7 @@ final class Sampler {
         let (cpuPercent, delta) = computeCpuDelta(currentCpu)
         let memory = readMemory()
         let network = readNetwork(elapsed: elapsed)
-        let processes = readProcesses(cpuDeltaTotal: delta)
+        let processes = readProcesses(cpuDeltaTotal: delta, sortMode: sortMode, filter: filter)
 
         return (cpuPercent, memory, network, processes, cpuCount)
     }
@@ -257,7 +269,7 @@ final class Sampler {
         return best
     }
 
-    private func readProcesses(cpuDeltaTotal: UInt64) -> [ProcessInfo] {
+    private func readProcesses(cpuDeltaTotal: UInt64, sortMode: SortMode, filter: String) -> [ProcessInfo] {
         guard let dir = opendir("/proc") else { return [] }
         defer { closedir(dir) }
 
@@ -287,6 +299,12 @@ final class Sampler {
             let totalTicks = parsed.utime + parsed.stime
             currentTotalPerPid[pid] = totalTicks
 
+            if !filter.isEmpty {
+                if !parsed.name.lowercased().contains(filter.lowercased()) && !String(pid).contains(filter) {
+                    continue
+                }
+            }
+
             let prevTicks = previousTotalPerPid[pid] ?? totalTicks
             let deltaTicks = totalTicks >= prevTicks ? totalTicks - prevTicks : UInt64(0)
 
@@ -313,8 +331,14 @@ final class Sampler {
         previousTotalPerPid = currentTotalPerPid
 
         rows.sort {
-            if $0.cpuPercent == $1.cpuPercent { return $0.memBytes > $1.memBytes }
-            return $0.cpuPercent > $1.cpuPercent
+            switch sortMode {
+            case .cpu:
+                if $0.cpuPercent == $1.cpuPercent { return $0.memBytes > $1.memBytes }
+                return $0.cpuPercent > $1.cpuPercent
+            case .memory:
+                if $0.memBytes == $1.memBytes { return $0.cpuPercent > $1.cpuPercent }
+                return $0.memBytes > $1.memBytes
+            }
         }
 
         return rows
@@ -353,12 +377,26 @@ func readKey() -> Key? {
     if n <= 0 { return nil }
     let bytes = Array(buf.prefix(Int(n)))
     if bytes.contains(3) { return .quit } // Ctrl-C
-    if bytes.contains(UInt8(ascii: "q")) { return .quit }
-    if bytes.contains(UInt8(ascii: "j")) { return .down }
-    if bytes.contains(UInt8(ascii: "k")) { return .up }
+    
+    if bytes.count == 1 {
+        let b = bytes[0]
+        if b == 27 { return .esc }
+        if b == UInt8(ascii: "q") { return .quit }
+        if b == UInt8(ascii: "j") { return .down }
+        if b == UInt8(ascii: "k") { return .up }
+        if b == UInt8(ascii: "h") { return .left }
+        if b == UInt8(ascii: "l") { return .right }
+        if b == UInt8(ascii: "/") { return .search }
+        if b == 127 || b == 8 { return .backspace }
+        if b == 10 || b == 13 { return .enter }
+        if b >= 32 && b <= 126 { return .char(Character(UnicodeScalar(b))) }
+    }
+    
     if bytes.count >= 3, bytes[0] == 27, bytes[1] == 91 {
         if bytes[2] == 65 { return .up }
         if bytes[2] == 66 { return .down }
+        if bytes[2] == 67 { return .right }
+        if bytes[2] == 68 { return .left }
     }
     return nil
 }
@@ -395,10 +433,13 @@ func render(
     network: NetworkSnapshot,
     processes: [ProcessInfo],
     selected: Int,
-    cpuCount: Int
+    cpuCount: Int,
+    sortMode: SortMode,
+    filter: String,
+    isSearching: Bool
 ) {
     let size = termSize()
-    let headerLines = 7
+    let headerLines = 8
     let tableStart = headerLines + 2
     let visibleRows = max(5, size.rows - tableStart - 2)
 
@@ -432,7 +473,14 @@ func render(
     appendLine(&out, "CPU: \(String(format: "%5.1f", cpu))%")
     appendLine(&out, "MEM: \(String(format: "%5.1f", memory.usedPercent))%  \(humanBytes(memory.usedBytes)) / \(humanBytes(memory.totalBytes))")
     appendLine(&out, "NET: \(network.iface)  rx \(humanBytes(UInt64(network.rxRate)))/s  tx \(humanBytes(UInt64(network.txRate)))/s")
-    appendLine(&out, "Controls: q quit, j/k or arrows move selection")
+    appendLine(&out, "Controls: q quit, j/k/arrows move, h/l/arrows sort, / search")
+    if isSearching {
+        appendLine(&out, "\u{001B}[1;32mSearch: /\(filter)\u{001B}[0m\u{001B}[5m_\u{001B}[0m")
+    } else if !filter.isEmpty {
+        appendLine(&out, "Filter: \(filter) (press / to edit)")
+    } else {
+        appendLine(&out, "")
+    }
     appendLine(&out, "")
 
     let pidCol = 7
@@ -441,15 +489,15 @@ func render(
     let thrCol = 4
     let fixed = pidCol + cpuCol + memCol + thrCol + 10
     let nameCol = max(12, size.cols - fixed)
-    let header = [
-        padRight("PID", pidCol),
-        padRight("NAME", nameCol),
-        padLeft("CPU%", cpuCol),
-        padLeft("MEM", memCol),
-        padLeft("THR", thrCol),
-    ].joined(separator: " ")
-    appendLine(&out, header)
-    appendLine(&out, String(repeating: "-", count: min(size.cols, max(40, header.count))))
+    
+    let h1 = padRight("PID", pidCol)
+    let h2 = padRight("NAME", nameCol)
+    let h3 = padLeft(sortMode == .cpu ? "CPU%▼" : "CPU%", cpuCol)
+    let h4 = padLeft(sortMode == .memory ? "MEM▼" : "MEM", memCol)
+    let h5 = padLeft("THR", thrCol)
+    
+    appendLine(&out, "\(h1) \(h2) \(h3) \(h4) \(h5)")
+    appendLine(&out, String(repeating: "-", count: min(size.cols, max(40, h1.count + h2.count + h3.count + h4.count + h5.count + 4))))
 
     for idx in scrollTop..<end {
         let p = processes[idx]
@@ -498,7 +546,10 @@ guard let terminal = TerminalRawMode() else {
 
 var sampler = Sampler()
 var selected = 0
-var latest = sampler.sample()
+var sortMode: SortMode = .cpu
+var filter = ""
+var isSearching = false
+var latest = sampler.sample(sortMode: sortMode, filter: filter)
 var running = true
 var nextSample = Date()
 var nextRender = Date()
@@ -517,35 +568,79 @@ while running {
     let pollRet = poll(&fds, 1, timeoutMs)
 
     var hadInput = false
+    let oldFilter = filter
     if pollRet > 0 && (fds[0].revents & Int16(POLLIN)) != 0 {
         while let key = readKey() {
             hadInput = true
-            switch key {
-            case .quit:
-                running = false
-            case .up:
-                selected -= 1
-            case .down:
-                selected += 1
+            if isSearching {
+                switch key {
+                case .quit:
+                    running = false
+                case .enter:
+                    isSearching = false
+                case .esc:
+                    isSearching = false
+                    filter = ""
+                case .backspace:
+                    if !filter.isEmpty { filter.removeLast() }
+                case .char(let c):
+                    filter.append(c)
+                default:
+                    break
+                }
+            } else {
+                switch key {
+                case .quit:
+                    running = false
+                case .up:
+                    selected -= 1
+                case .down:
+                    selected += 1
+                case .left:
+                    sortMode = .cpu
+                case .right:
+                    sortMode = .memory
+                case .search:
+                    isSearching = true
+                default:
+                    break
+                }
             }
         }
     }
 
-    selected = clamp(selected, 0, max(0, latest.3.count - 1))
+    if filter != oldFilter {
+        selected = 0
+    }
+
     if hadInput {
+        if isSearching || filter != "" || sortMode != .cpu { // Rough check if we need to re-sample immediately
+             latest = sampler.sample(sortMode: sortMode, filter: filter)
+        }
+        selected = clamp(selected, 0, max(0, latest.3.count - 1))
         needsRender = true
     }
 
     let nowPostPoll = Date()
     if nowPostPoll >= nextSample {
-        latest = sampler.sample()
+        latest = sampler.sample(sortMode: sortMode, filter: filter)
         selected = clamp(selected, 0, max(0, latest.3.count - 1))
         needsRender = true
         nextSample = nowPostPoll.addingTimeInterval(sampleInterval)
     }
 
     if needsRender && nowPostPoll >= nextRender {
-        render(cpu: latest.0, memory: latest.1, network: latest.2, processes: latest.3, selected: selected, cpuCount: latest.4)
+        render(
+            cpu: latest.0,
+            memory: latest.1,
+            network: latest.2,
+            processes: latest.3,
+            selected: selected,
+            cpuCount: latest.4,
+            sortMode: sortMode,
+            filter: filter,
+            isSearching: isSearching
+        )
         needsRender = false
         nextRender = nowPostPoll.addingTimeInterval(renderInterval)
     }
