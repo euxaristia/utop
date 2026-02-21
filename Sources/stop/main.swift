@@ -74,6 +74,7 @@ struct GpuSnapshot {
     let usage: Double?      // 0-100%
     let memUsed: UInt64?
     let memTotal: UInt64?
+    let temp: Double?       // Celsius
     
     var memPercent: Double? {
         guard let used = memUsed, let total = memTotal, total > 0 else { return nil }
@@ -168,19 +169,78 @@ final class Sampler {
     private var lastNvidiaSampleAt: Date = Date.distantPast
     private var lastNvidiaGpu: GpuSnapshot?
 
-    func sample(sortMode: SortMode, filter: String) -> (Double, MemorySnapshot, NetworkSnapshot, GpuSnapshot?, [ProcessInfo], Int) {
+    func sample(sortMode: SortMode, filter: String) -> (Double, Double?, MemorySnapshot, NetworkSnapshot, GpuSnapshot?, [ProcessInfo], Int) {
         let now = Date()
         let elapsed = max(0.001, now.timeIntervalSince(lastSampleAt))
         lastSampleAt = now
 
         let currentCpu = readCpuTimes()
         let (cpuPercent, delta) = computeCpuDelta(currentCpu)
+        let cpuTemp = readCpuTemp()
         let memory = readMemory()
         let network = readNetwork(elapsed: elapsed)
         let gpu = readGpu()
         let processes = readProcesses(cpuDeltaTotal: delta, sortMode: sortMode, filter: filter)
 
-        return (cpuPercent, memory, network, gpu, processes, cpuCount)
+        return (cpuPercent, cpuTemp, memory, network, gpu, processes, cpuCount)
+    }
+
+    private func readCpuTemp() -> Double? {
+        // Try thermal_zone (usually more standard)
+        if let dir = opendir("/sys/class/thermal") {
+            defer { closedir(dir) }
+            while let entry = readdir(dir) {
+                let name = withUnsafePointer(to: entry.pointee.d_name) { ptr in
+                    String(cString: UnsafeRawPointer(ptr).assumingMemoryBound(to: CChar.self))
+                }
+                if name.hasPrefix("thermal_zone") {
+                    let typePath = "/sys/class/thermal/\(name)/type"
+                    if let type = (try? String(contentsOfFile: typePath, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines),
+                       type.lowercased().contains("pkg") || type.lowercased().contains("cpu") || type.lowercased().contains("core") {
+                        let tempPath = "/sys/class/thermal/\(name)/temp"
+                        if let tempStr = (try? String(contentsOfFile: tempPath, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines),
+                           let t = Double(tempStr) {
+                            return t / 1000.0
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Fallback to hwmon
+        if let dir = opendir("/sys/class/hwmon") {
+            defer { closedir(dir) }
+            while let entry = readdir(dir) {
+                let name = withUnsafePointer(to: entry.pointee.d_name) { ptr in
+                    String(cString: UnsafeRawPointer(ptr).assumingMemoryBound(to: CChar.self))
+                }
+                if name.hasPrefix("hwmon") {
+                    let path = "/sys/class/hwmon/\(name)"
+                    let namePath = "\(path)/name"
+                    if let hwName = (try? String(contentsOfFile: namePath, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines),
+                       hwName.lowercased().contains("coretemp") || hwName.lowercased().contains("cpu") || hwName.lowercased().contains("k10temp") {
+                        // Look for temp1_input or temp*_input
+                        var bestTemp: Double?
+                        if let hDir = opendir(path) {
+                            defer { closedir(hDir) }
+                            while let hEntry = readdir(hDir) {
+                                let hName = withUnsafePointer(to: hEntry.pointee.d_name) { ptr in
+                                    String(cString: UnsafeRawPointer(ptr).assumingMemoryBound(to: CChar.self))
+                                }
+                                if hName.hasPrefix("temp") && hName.hasSuffix("_input") {
+                                    if let tStr = (try? String(contentsOfFile: "\(path)/\(hName)", encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines),
+                                       let t = Double(tStr) {
+                                        bestTemp = max(bestTemp ?? 0, t / 1000.0)
+                                    }
+                                }
+                            }
+                        }
+                        if let bt = bestTemp { return bt }
+                    }
+                }
+            }
+        }
+        return nil
     }
 
     private func readGpu() -> GpuSnapshot? {
@@ -223,6 +283,24 @@ final class Sampler {
                         // Try to get VRAM
                         var usedVram: UInt64?
                         var totalVram: UInt64?
+                        var gpuTemp: Double?
+                        
+                        // Try to find temp in hwmon inside device or sibling
+                        let hwmonDir = "\(devicePath)/hwmon"
+                        if let hDir = opendir(hwmonDir) {
+                            defer { closedir(hDir) }
+                            while let hEntry = readdir(hDir) {
+                                let hName = withUnsafePointer(to: hEntry.pointee.d_name) { ptr in
+                                    String(cString: UnsafeRawPointer(ptr).assumingMemoryBound(to: CChar.self))
+                                }
+                                if hName.hasPrefix("hwmon") {
+                                    if let tStr = (try? String(contentsOfFile: "\(hwmonDir)/\(hName)/temp1_input", encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines),
+                                       let t = Double(tStr) {
+                                        gpuTemp = t / 1000.0
+                                    }
+                                }
+                            }
+                        }
                         
                         // AMD specific
                         if let uStr = try? String(contentsOfFile: "\(devicePath)/mem_info_vram_used", encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
@@ -246,7 +324,7 @@ final class Sampler {
                             }
                         }
                         
-                        return GpuSnapshot(name: nameStr, usage: usage, memUsed: usedVram, memTotal: totalVram)
+                        return GpuSnapshot(name: nameStr, usage: usage, memUsed: usedVram, memTotal: totalVram, temp: gpuTemp)
                     }
                 }
             }
@@ -271,7 +349,13 @@ final class Sampler {
                 }
                 
                 if let u = usage {
-                    return GpuSnapshot(name: "Adreno GPU", usage: u, memUsed: nil, memTotal: nil)
+                    // Try to get temp for Adreno
+                    var aTemp: Double?
+                    if let tStr = (try? String(contentsOfFile: "/sys/class/thermal/thermal_zone0/temp", encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines),
+                       let t = Double(tStr) {
+                        aTemp = t / 1000.0
+                    }
+                    return GpuSnapshot(name: "Adreno GPU", usage: u, memUsed: nil, memTotal: nil, temp: aTemp)
                 }
             }
         }
@@ -283,7 +367,7 @@ final class Sampler {
             let pipe = Pipe()
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/usr/bin/nvidia-smi")
-            process.arguments = ["--query-gpu=utilization.gpu,memory.used,memory.total", "--format=csv,noheader,nounits"]
+            process.arguments = ["--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu", "--format=csv,noheader,nounits"]
             process.standardOutput = pipe
             
             do {
@@ -292,11 +376,12 @@ final class Sampler {
                 let data = pipe.fileHandleForReading.readDataToEndOfFile()
                 if let output = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) {
                     let parts = output.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
-                    if parts.count >= 3 {
+                    if parts.count >= 4 {
                         let usage = Double(parts[0])
                         let used = UInt64(parts[1]).map { $0 * 1024 * 1024 } // MiB to bytes
                         let total = UInt64(parts[2]).map { $0 * 1024 * 1024 } // MiB to bytes
-                        lastNvidiaGpu = GpuSnapshot(name: "NVIDIA GPU", usage: usage, memUsed: used, memTotal: total)
+                        let temp = Double(parts[3])
+                        lastNvidiaGpu = GpuSnapshot(name: "NVIDIA GPU", usage: usage, memUsed: used, memTotal: total, temp: temp)
                     }
                 }
             } catch {
@@ -569,6 +654,7 @@ func padLeft(_ s: String, _ width: Int) -> String {
 
 func render(
     cpu: Double,
+    cpuTemp: Double?,
     memory: MemorySnapshot,
     network: NetworkSnapshot,
     gpu: GpuSnapshot?,
@@ -611,16 +697,19 @@ func render(
     // Repaint in-place and clear each row to avoid stale text artifacts.
     var out = "\u{001B}[H"
     appendLine(&out, "stop (pure Swift, no libs)    CPUs: \(cpuCount)")
-    appendLine(&out, "CPU: \(String(format: "%5.1f", cpu))%")
+    
+    let cpuTempStr = cpuTemp.map { String(format: " %4.1f°C", $0) } ?? ""
+    appendLine(&out, "CPU: \(String(format: "%5.1f", cpu))%\(cpuTempStr)")
     appendLine(&out, "MEM: \(String(format: "%5.1f", memory.usedPercent))%  \(humanBytes(memory.usedBytes)) / \(humanBytes(memory.totalBytes))")
     
     if let g = gpu {
         let usageStr = g.usage.map { String(format: "%5.1f%%", $0) } ?? " - %"
+        let gTempStr = g.temp.map { String(format: " %4.1f°C", $0) } ?? ""
         var vramStr = ""
         if let used = g.memUsed, let total = g.memTotal {
             vramStr = "  VRAM: \(humanBytes(used)) / \(humanBytes(total))"
         }
-        appendLine(&out, "\(g.name): \(usageStr)\(vramStr)")
+        appendLine(&out, "\(g.name): \(usageStr)\(gTempStr)\(vramStr)")
     } else {
         appendLine(&out, "GPU: - %")
     }
@@ -770,14 +859,14 @@ while running {
         if isSearching || filter != "" || sortMode != .cpu { // Rough check if we need to re-sample immediately
              latest = sampler.sample(sortMode: sortMode, filter: filter)
         }
-        selected = clamp(selected, 0, max(0, latest.4.count - 1))
+        selected = clamp(selected, 0, max(0, latest.5.count - 1))
         needsRender = true
     }
 
     let nowPostPoll = Date()
     if nowPostPoll >= nextSample {
         latest = sampler.sample(sortMode: sortMode, filter: filter)
-        selected = clamp(selected, 0, max(0, latest.4.count - 1))
+        selected = clamp(selected, 0, max(0, latest.5.count - 1))
         needsRender = true
         nextSample = nowPostPoll.addingTimeInterval(sampleInterval)
     }
@@ -785,12 +874,13 @@ while running {
     if needsRender && nowPostPoll >= nextRender {
         render(
             cpu: latest.0,
-            memory: latest.1,
-            network: latest.2,
-            gpu: latest.3,
-            processes: latest.4,
+            cpuTemp: latest.1,
+            memory: latest.2,
+            network: latest.3,
+            gpu: latest.4,
+            processes: latest.5,
             selected: selected,
-            cpuCount: latest.5,
+            cpuCount: latest.6,
             sortMode: sortMode,
             filter: filter,
             isSearching: isSearching
