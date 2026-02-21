@@ -81,6 +81,7 @@ struct ProcessRowData {
     cpu_total_percent: f32,
     mem_percent: f64,
     tree_prefix: String,
+    display_name: String,
     threads_text: String,
     mem_text: String,
     cpu_cell_per_core: String,
@@ -283,7 +284,7 @@ impl App {
                         pid_num: p.pid().as_u32(),
                         parent_pid: p.parent().map(|pp| pp.as_u32()),
                         name_lc: name.to_lowercase(),
-                        name,
+                        name: name.clone(),
                         command: p
                             .cmd()
                             .iter()
@@ -302,6 +303,7 @@ impl App {
                         cpu_total_percent,
                         mem_percent: (mem_bytes as f64 / total_mem * 100.0).clamp(0.0, 100.0),
                         tree_prefix: String::new(),
+                        display_name: name.clone(),
                         threads_text: threads.to_string(),
                         mem_text: format!("{:>6}", human_bytes(mem_bytes)),
                         cpu_cell_per_core: format!(
@@ -396,6 +398,13 @@ impl App {
 
         if self.sort_reverse {
             rows.reverse();
+        }
+        for row in &mut rows {
+            row.display_name = if self.tree_mode {
+                format!("{}{}", row.tree_prefix, row.name)
+            } else {
+                row.name.clone()
+            };
         }
 
         self.process_rows = rows;
@@ -1090,25 +1099,17 @@ fn ui(f: &mut Frame, app: &mut App) {
             if absolute_index == app.selected_process {
                 row_style = Style::default().fg(Color::Black).bg(Color::Yellow);
             }
-            Row::new(vec![
-                Cell::from(p.pid.clone()),
-                Cell::from(if app.tree_mode {
-                    format!("{}{}", p.tree_prefix, p.name)
-                } else {
-                    p.name.clone()
-                }),
-                Cell::from(if p.command.is_empty() {
-                    p.name.clone()
-                } else {
-                    p.command.clone()
-                }),
-                Cell::from(p.threads_text.clone()),
-                Cell::from(p.user.clone()),
-                Cell::from(p.mem_text.clone()),
+            Row::new([
+                Cell::from(p.pid.as_str()),
+                Cell::from(p.display_name.as_str()),
+                Cell::from(p.command.as_str()),
+                Cell::from(p.threads_text.as_str()),
+                Cell::from(p.user.as_str()),
+                Cell::from(p.mem_text.as_str()),
                 Cell::from(if app.per_core {
-                    p.cpu_cell_per_core.clone()
+                    p.cpu_cell_per_core.as_str()
                 } else {
-                    p.cpu_cell_total.clone()
+                    p.cpu_cell_total.as_str()
                 }),
             ])
             .style(row_style)
