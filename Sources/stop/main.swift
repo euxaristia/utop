@@ -146,31 +146,26 @@ final class Sampler {
         let elapsed = max(0.001, now.timeIntervalSince(lastSampleAt))
         lastSampleAt = now
 
-        let cpuTimes = readCpuTimes()
-        let cpuPercent = computeCpuPercent(cpuTimes)
+        let currentCpu = readCpuTimes()
+        let (cpuPercent, delta) = computeCpuDelta(currentCpu)
         let memory = readMemory()
         let network = readNetwork(elapsed: elapsed)
-        let processes = readProcesses(cpuDeltaTotal: cpuDelta(cpuTimes))
+        let processes = readProcesses(cpuDeltaTotal: delta)
 
         return (cpuPercent, memory, network, processes, cpuCount)
     }
 
-    private func computeCpuPercent(_ current: CpuTimes?) -> Double {
-        guard let current else { return 0.0 }
+    private func computeCpuDelta(_ current: CpuTimes?) -> (Double, UInt64) {
+        guard let current else { return (0.0, 0) }
         defer { previousCpu = current }
-        guard let prev = previousCpu else { return 0.0 }
+        guard let prev = previousCpu else { return (0.0, 0) }
 
         let totalDelta = current.total > prev.total ? current.total - prev.total : 0
         let idleDelta = current.idleTotal > prev.idleTotal ? current.idleTotal - prev.idleTotal : 0
-        guard totalDelta > 0 else { return 0.0 }
+        guard totalDelta > 0 else { return (0.0, 0) }
         let used = totalDelta > idleDelta ? totalDelta - idleDelta : 0
-        return min(100.0, (Double(used) / Double(totalDelta)) * 100.0)
-    }
-
-    private func cpuDelta(_ current: CpuTimes?) -> UInt64 {
-        guard let current else { return 0 }
-        guard let prev = previousCpu else { return 0 }
-        return current.total > prev.total ? current.total - prev.total : 0
+        let percent = min(100.0, (Double(used) / Double(totalDelta)) * 100.0)
+        return (percent, totalDelta)
     }
 
     private func readCpuTimes() -> CpuTimes? {
@@ -263,22 +258,37 @@ final class Sampler {
     }
 
     private func readProcesses(cpuDeltaTotal: UInt64) -> [ProcessInfo] {
-        let fm = FileManager.default
-        let entries = (try? fm.contentsOfDirectory(atPath: "/proc")) ?? []
+        guard let dir = opendir("/proc") else { return [] }
+        defer { closedir(dir) }
+
         var currentTotalPerPid: [Int: UInt64] = [:]
         var rows: [ProcessInfo] = []
         rows.reserveCapacity(512)
 
-        for entry in entries {
-            guard let pid = Int(entry) else { continue }
-            guard let statText = try? String(contentsOfFile: "/proc/\(entry)/stat", encoding: .utf8) else { continue }
-            guard let parsed = parseProcStat(statText) else { continue }
+        let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: 1024)
+        defer { buffer.deallocate() }
+
+        while let entry = readdir(dir) {
+            let name = withUnsafePointer(to: entry.pointee.d_name) { ptr in
+                String(cString: UnsafeRawPointer(ptr).assumingMemoryBound(to: CChar.self))
+            }
+            guard let pid = Int(name) else { continue }
+
+            let path = "/proc/\(name)/stat"
+            let fd = open(path, O_RDONLY)
+            if fd < 0 { continue }
+            let bytesRead = read(fd, buffer, 1024)
+            close(fd)
+            if bytesRead <= 0 { continue }
+
+            let statStr = String(decoding: UnsafeBufferPointer(start: buffer, count: bytesRead), as: UTF8.self)
+            guard let parsed = parseProcStat(statStr) else { continue }
 
             let totalTicks = parsed.utime + parsed.stime
             currentTotalPerPid[pid] = totalTicks
 
             let prevTicks = previousTotalPerPid[pid] ?? totalTicks
-            let deltaTicks = totalTicks >= prevTicks ? totalTicks - prevTicks : 0
+            let deltaTicks = totalTicks >= prevTicks ? totalTicks - prevTicks : UInt64(0)
 
             let cpuPercent: Double
             if cpuDeltaTotal == 0 {
@@ -289,12 +299,10 @@ final class Sampler {
             }
 
             let rssBytes = UInt64(parsed.rssPages) * pageSize
-            let name = parsed.name.isEmpty ? "?" : parsed.name
-
             rows.append(
                 ProcessInfo(
                     pid: pid,
-                    name: name,
+                    name: parsed.name,
                     cpuPercent: cpuPercent,
                     memBytes: rssBytes,
                     threads: parsed.numThreads
@@ -499,16 +507,27 @@ let renderInterval: TimeInterval = 1.0 / 30.0
 var needsRender = true
 
 while running {
+    let now = Date()
+    let timeToSample = max(0, nextSample.timeIntervalSince(now))
+    let timeToRender = needsRender ? max(0, nextRender.timeIntervalSince(now)) : timeToSample
+    let waitTime = min(timeToSample, timeToRender)
+    let timeoutMs = Int32(waitTime * 1000)
+
+    var fds = [pollfd(fd: STDIN_FILENO, events: Int16(POLLIN), revents: 0)]
+    let pollRet = poll(&fds, 1, timeoutMs)
+
     var hadInput = false
-    while let key = readKey() {
-        hadInput = true
-        switch key {
-        case .quit:
-            running = false
-        case .up:
-            selected -= 1
-        case .down:
-            selected += 1
+    if pollRet > 0 && (fds[0].revents & Int16(POLLIN)) != 0 {
+        while let key = readKey() {
+            hadInput = true
+            switch key {
+            case .quit:
+                running = false
+            case .up:
+                selected -= 1
+            case .down:
+                selected += 1
+            }
         }
     }
 
@@ -517,20 +536,19 @@ while running {
         needsRender = true
     }
 
-    if Date() >= nextSample {
+    let nowPostPoll = Date()
+    if nowPostPoll >= nextSample {
         latest = sampler.sample()
         selected = clamp(selected, 0, max(0, latest.3.count - 1))
         needsRender = true
-        nextSample = Date().addingTimeInterval(sampleInterval)
+        nextSample = nowPostPoll.addingTimeInterval(sampleInterval)
     }
 
-    if needsRender && Date() >= nextRender {
+    if needsRender && nowPostPoll >= nextRender {
         render(cpu: latest.0, memory: latest.1, network: latest.2, processes: latest.3, selected: selected, cpuCount: latest.4)
         needsRender = false
-        nextRender = Date().addingTimeInterval(renderInterval)
+        nextRender = nowPostPoll.addingTimeInterval(renderInterval)
     }
-
-    usleep(10_000)
 }
 
 terminal.restoreNow()
