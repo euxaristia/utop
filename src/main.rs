@@ -810,6 +810,9 @@ fn ui(f: &mut Frame, app: &mut App) {
     let avail_mem = app.system.available_memory();
     let free_mem = app.system.free_memory();
     let cached_mem = total_mem.saturating_sub(used_mem).saturating_sub(free_mem);
+    let total_swap = app.system.total_swap();
+    let used_swap = app.system.used_swap();
+    let free_swap = app.system.free_swap();
 
     f.render_widget(Clear, upper_left[0]);
     let mem_block = Block::default()
@@ -820,16 +823,19 @@ fn ui(f: &mut Frame, app: &mut App) {
     f.render_widget(mem_block, upper_left[0]);
     f.render_widget(
         Paragraph::new(format!(
-            "Total:{:>12.2} GiB\nUsed:{:>13.2} GiB\n{:>18.0}%\n\nAvailable:{:>8.2} GiB\n{:>18.0}%\n\nCached:{:>11.2} GiB\n{:>18.0}%\n\nFree:{:>13.2} GiB\n{:>18.0}%",
-            gib(total_mem),
-            gib(used_mem),
+            "MEM  {:>5.1}% {:<10} {:>6.2}/{:>6.2} GiB\nSWAP {:>5.1}% {:<10} {:>6.2}/{:>6.2} GiB\n\nAvailable:{:>8.2} GiB\nCached:{:>11.2} GiB\nFree:{:>13.2} GiB\nSwap free:{:>8.2} GiB",
             pct(used_mem, total_mem),
+            bar(pct(used_mem, total_mem) as f32, 8),
+            gib(used_mem),
+            gib(total_mem),
+            pct(used_swap, total_swap),
+            bar(pct(used_swap, total_swap) as f32, 8),
+            gib(used_swap),
+            gib(total_swap),
             gib(avail_mem),
-            pct(avail_mem, total_mem),
             gib(cached_mem),
-            pct(cached_mem, total_mem),
             gib(free_mem),
-            pct(free_mem, total_mem),
+            gib(free_swap),
         ))
         .style(Style::default().fg(Color::White)),
         mem_inner,
