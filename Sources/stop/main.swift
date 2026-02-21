@@ -169,6 +169,7 @@ final class Sampler {
 
     private var lastNvidiaSampleAt: Date = Date.distantPast
     private var lastNvidiaGpu: GpuSnapshot?
+    private var lastV3dStats: [String: (UInt64, UInt64)] = [:]
     private var cachedRamSpeed: String?
     private var checkedRamSpeed = false
 
@@ -296,14 +297,36 @@ final class Sampler {
                     let usagePaths = [
                         "\(devicePath)/gpu_busy_percent", // AMD, RPi
                         "\(cardPath)/gt/gt0/usage",      // Intel (newer)
-                        "\(devicePath)/usage"            // Generic
+                        "\(devicePath)/usage",           // Generic
+                        "\(devicePath)/load"             // Broadcom/v3d
                     ]
                     
                     for p in usagePaths {
-                        if let valStr = try? String(contentsOfFile: p, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
-                           let u = Double(valStr) {
-                            usage = u
-                            break
+                        if let valStr = try? String(contentsOfFile: p, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines) {
+                            // Handle "usage@freq" format found in devfreq and some ARM drivers
+                            let firstPart = valStr.split(separator: "@").first.map(String.init) ?? valStr
+                            if let u = Double(firstPart) {
+                                usage = u
+                                break
+                            }
+                        }
+                    }
+                    
+                    if usage == nil {
+                        // Broadcom v3d gpu_stats
+                        if let stats = try? String(contentsOfFile: "\(devicePath)/gpu_stats", encoding: .utf8) {
+                            let lines = stats.split(separator: "\n").dropFirst()
+                            for line in lines {
+                                let parts = line.split(whereSeparator: { $0.isWhitespace })
+                                if parts.count >= 4, let ts = UInt64(parts[1]), let rt = UInt64(parts[3]) {
+                                    let queue = String(parts[0])
+                                    if let last = lastV3dStats[queue], ts > last.0 {
+                                        let u = (Double(rt - last.1) / Double(ts - last.0)) * 100.0
+                                        usage = max(usage ?? 0, u)
+                                    }
+                                    lastV3dStats[queue] = (ts, rt)
+                                }
+                            }
                         }
                     }
                     
@@ -315,6 +338,15 @@ final class Sampler {
                         if vendor == "0x1002" { nameStr = "AMD GPU" }
                         else if vendor == "0x8086" { nameStr = "Intel GPU" }
                         else if vendor == "0x10de" { nameStr = "NVIDIA GPU" }
+                        else if vendor == "0x14e4" { nameStr = "Broadcom GPU" }
+                        else {
+                            // Check for Broadcom/VideoCore via uevent/driver
+                            if let uevent = try? String(contentsOfFile: "\(devicePath)/uevent", encoding: .utf8) {
+                                if uevent.contains("DRIVER=v3d") || uevent.contains("DRIVER=vc4") {
+                                    nameStr = "VideoCore GPU"
+                                }
+                            }
+                        }
                         
                         // Try to get VRAM
                         var usedVram: UInt64?
@@ -338,6 +370,14 @@ final class Sampler {
                             }
                         }
                         
+                        if gpuTemp == nil {
+                            // Generic fallback for SoC (RPi, etc.)
+                            if let tStr = (try? String(contentsOfFile: "/sys/class/thermal/thermal_zone0/temp", encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines),
+                               let t = Double(tStr) {
+                                gpuTemp = t / 1000.0
+                            }
+                        }
+                        
                         // AMD specific
                         if let uStr = try? String(contentsOfFile: "\(devicePath)/mem_info_vram_used", encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
                            let u = UInt64(uStr) {
@@ -357,6 +397,25 @@ final class Sampler {
                             if let tStr = try? String(contentsOfFile: "\(cardPath)/tile0/vram0/size", encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
                                let t = UInt64(tStr) {
                                 totalVram = t
+                            }
+                        }
+
+                        // VideoCore / Broadcom CMA fallback
+                        if usedVram == nil && nameStr == "VideoCore GPU" {
+                            if let meminfo = try? String(contentsOfFile: "/proc/meminfo", encoding: .utf8) {
+                                var cmaTotal: UInt64 = 0
+                                var cmaFree: UInt64 = 0
+                                for line in meminfo.split(separator: "\n") {
+                                    if line.hasPrefix("CmaTotal:") {
+                                        cmaTotal = parseMeminfoKB(line) * 1024
+                                    } else if line.hasPrefix("CmaFree:") {
+                                        cmaFree = parseMeminfoKB(line) * 1024
+                                    }
+                                }
+                                if cmaTotal > 0 {
+                                    usedVram = cmaTotal > cmaFree ? cmaTotal - cmaFree : 0
+                                    totalVram = cmaTotal
+                                }
                             }
                         }
                         
@@ -392,6 +451,36 @@ final class Sampler {
                         aTemp = t / 1000.0
                     }
                     return GpuSnapshot(name: "Adreno GPU", usage: u, memUsed: nil, memTotal: nil, temp: aTemp)
+                }
+            }
+        }
+        
+        // 4. Generic devfreq fallback (RPi, Mali, etc.)
+        if let dir = opendir("/sys/class/devfreq") {
+            defer { closedir(dir) }
+            while let entry = readdir(dir) {
+                let dfName = withUnsafePointer(to: entry.pointee.d_name) { ptr in
+                    String(cString: UnsafeRawPointer(ptr).assumingMemoryBound(to: CChar.self))
+                }
+                if dfName.contains("v3d") || dfName.contains("gpu") || dfName.contains("mali") {
+                    let loadPath = "/sys/class/devfreq/\(dfName)/load"
+                    if let loadStr = try? String(contentsOfFile: loadPath, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines) {
+                        let usagePart = loadStr.split(separator: "@").first.map(String.init) ?? loadStr
+                        if let u = Double(usagePart) {
+                            var gpuTemp: Double?
+                            if let tStr = (try? String(contentsOfFile: "/sys/class/thermal/thermal_zone0/temp", encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines),
+                               let t = Double(tStr) {
+                                gpuTemp = t / 1000.0
+                            }
+                            
+                            let name: String
+                            if dfName.contains("v3d") { name = "VideoCore GPU" }
+                            else if dfName.contains("mali") { name = "Mali GPU" }
+                            else { name = "GPU" }
+                            
+                            return GpuSnapshot(name: name, usage: u, memUsed: nil, memTotal: nil, temp: gpuTemp)
+                        }
+                    }
                 }
             }
         }
