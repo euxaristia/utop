@@ -420,7 +420,7 @@ func render(
 
     // Repaint in-place and clear each row to avoid stale text artifacts.
     var out = "\u{001B}[H"
-    appendLine(&out, "rtop (pure Swift, no libs)    CPUs: \(cpuCount)")
+    appendLine(&out, "stop (pure Swift, no libs)    CPUs: \(cpuCount)")
     appendLine(&out, "CPU: \(String(format: "%5.1f", cpu))%")
     appendLine(&out, "MEM: \(String(format: "%5.1f", memory.usedPercent))%  \(humanBytes(memory.usedBytes)) / \(humanBytes(memory.totalBytes))")
     appendLine(&out, "NET: \(network.iface)  rx \(humanBytes(UInt64(network.rxRate)))/s  tx \(humanBytes(UInt64(network.txRate)))/s")
@@ -473,7 +473,7 @@ func render(
 }
 
 if isatty(STDIN_FILENO) != 1 || isatty(STDOUT_FILENO) != 1 {
-    fputs("rtop requires an interactive terminal (TTY). Run it directly in a terminal session.\n", stderr)
+    fputs("stop requires an interactive terminal (TTY). Run it directly in a terminal session.\n", stderr)
     exit(1)
 }
 

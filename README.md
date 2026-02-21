@@ -1,6 +1,6 @@
-# rtop (Swift)
+# stop (Swift)
 
-`rtop` is now a pure Swift terminal system monitor for Linux.
+`stop` is now a pure Swift terminal system monitor for Linux.
 
 - No third-party libraries.
 - Data source is Linux `/proc`.
@@ -28,7 +28,7 @@ swift build -c release
 ## Run
 
 ```bash
-swift run -c release rtop
+swift run -c release stop
 ```
 
 ## Controls

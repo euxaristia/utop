@@ -2,13 +2,13 @@
 import PackageDescription
 
 let package = Package(
-    name: "rtop",
+    name: "stop",
     products: [
-        .executable(name: "rtop", targets: ["rtop"])
+        .executable(name: "stop", targets: ["stop"])
     ],
     targets: [
         .executableTarget(
-            name: "rtop",
+            name: "stop",
             dependencies: []
         )
     ]
