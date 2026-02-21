@@ -1173,7 +1173,12 @@ fn ui(f: &mut Frame, app: &mut App) {
     } else {
         app.selected_process + 1
     };
-    let footer_right = format!("{current}/{}", app.process_count());
+    let footer_right = format!(
+        "u:{:.1} d:{:.1} {current}/{}",
+        app.perf_update_ms_ema,
+        app.perf_draw_ms_ema,
+        app.process_count()
+    );
     let width = root[2].width as usize;
     let spacer = width.saturating_sub(footer_left.chars().count() + footer_right.len());
     f.render_widget(
