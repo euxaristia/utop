@@ -102,7 +102,6 @@ enum Key {
     case down
     case left
     case right
-    case search
     case backspace
     case enter
     case esc
@@ -758,12 +757,6 @@ func readKey() -> Key? {
     if bytes.count == 1 {
         let b = bytes[0]
         if b == 27 { return .esc }
-        if b == UInt8(ascii: "q") { return .quit }
-        if b == UInt8(ascii: "j") { return .down }
-        if b == UInt8(ascii: "k") { return .up }
-        if b == UInt8(ascii: "h") { return .left }
-        if b == UInt8(ascii: "l") { return .right }
-        if b == UInt8(ascii: "/") { return .search }
         if b == 127 || b == 8 { return .backspace }
         if b == 10 || b == 13 { return .enter }
         if b >= 32 && b <= 126 { return .char(Character(UnicodeScalar(b))) }
@@ -996,8 +989,16 @@ while running {
                     sortMode = .cpu
                 case .right:
                     sortMode = .memory
-                case .search:
-                    isSearching = true
+                case .char(let c):
+                    switch c {
+                    case "q": running = false
+                    case "j": selected += 1
+                    case "k": selected -= 1
+                    case "h": sortMode = .cpu
+                    case "l": sortMode = .memory
+                    case "/": isSearching = true
+                    default: break
+                    }
                 default:
                     break
                 }
