@@ -5,6 +5,8 @@ edition = "2024"
 license = "GPL-3.0"
 
 [dependencies]
-crossterm = { version = "0.29.0", default-features = false, features = ["events"] }
 ratatui = { version = "0.30.0", default-features = false, features = ["crossterm"] }
-sysinfo = { version = "0.38.2", default-features = false, features = ["disk", "system"] }
+sysinfo = { version = "0.38.2", default-features = false, features = ["system"] }
+
+[patch.crates-io]
+ratatui-crossterm = { path = "vendor/ratatui-crossterm" }

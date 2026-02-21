@@ -1,4 +1,4 @@
-use crossterm::{
+use ratatui::crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -21,7 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 use sysinfo::{
-    CpuRefreshKind, Disks, LoadAvg, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind,
+    CpuRefreshKind, LoadAvg, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind,
 };
 
 const MAX_CPU_HISTORY: usize = 240;
@@ -90,6 +90,23 @@ struct ProcessRowData {
     cpu_cell_total: String,
 }
 
+#[derive(Clone)]
+struct DiskRow {
+    mount: String,
+    total: u64,
+    available: u64,
+}
+
+impl DiskRow {
+    fn total_space(&self) -> u64 {
+        self.total
+    }
+
+    fn available_space(&self) -> u64 {
+        self.available
+    }
+}
+
 impl ProcessRowData {
     fn display_cpu(&self, per_core: bool) -> f32 {
         if per_core {
@@ -119,7 +136,7 @@ enum ModalState {
 
 struct App {
     system: System,
-    disks: Disks,
+    disks: Vec<DiskRow>,
     last_tick: Instant,
     tick_rate: Duration,
     cpu_count: usize,
@@ -170,7 +187,7 @@ impl App {
     fn new() -> Self {
         let mut app = Self {
             system: System::new_all(),
-            disks: Disks::new_with_refreshed_list(),
+            disks: read_disks_df(),
             last_tick: Instant::now(),
             tick_rate: Duration::from_millis(1000),
             cpu_count: 1,
@@ -249,7 +266,7 @@ impl App {
             self.last_process_refresh = Instant::now();
         }
         if self.last_disk_refresh.elapsed() >= Duration::from_secs(5) {
-            self.disks.refresh(false);
+            self.disks = read_disks_df();
             self.last_disk_refresh = Instant::now();
         }
         self.cpu_count = self.system.cpus().len().max(1);
@@ -953,7 +970,6 @@ fn ui(f: &mut Frame, app: &mut App) {
     f.render_widget(disks_block, upper_left[1]);
     let disk_lines = app
         .disks
-        .list()
         .iter()
         .take(4)
         .map(|disk| {
@@ -963,7 +979,7 @@ fn ui(f: &mut Frame, app: &mut App) {
             let used_pct = pct(used, total) as f32;
             format!(
                 "{}\nUsed:{:>4.0}% {:<14} {:>6.1}G\nFree:{:>4.0}% {:<14} {:>6.1}G",
-                friendly_mount(disk.mount_point()),
+                disk.mount.as_str(),
                 used_pct,
                 bar(used_pct, 10),
                 gib(used),
@@ -1503,6 +1519,37 @@ fn read_primary_netdev(preferred_iface: &str) -> Option<(String, u64, u64)> {
         }
     }
     selected
+}
+
+fn read_disks_df() -> Vec<DiskRow> {
+    let output = Command::new("df").arg("-B1P").output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut rows = Vec::new();
+    for line in text.lines().skip(1) {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 6 {
+            continue;
+        }
+        let Ok(total) = parts[1].parse::<u64>() else {
+            continue;
+        };
+        let Ok(available) = parts[3].parse::<u64>() else {
+            continue;
+        };
+        let mount = parts[5].to_string();
+        rows.push(DiskRow {
+            mount: friendly_mount(Path::new(&mount)),
+            total,
+            available,
+        });
+    }
+    rows
 }
 
 fn gib(bytes: u64) -> f64 {
