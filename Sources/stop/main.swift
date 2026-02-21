@@ -295,7 +295,7 @@ final class Sampler {
                 cpuPercent = 0.0
             } else {
                 let ratio = Double(deltaTicks) / Double(cpuDeltaTotal)
-                cpuPercent = min(Double(cpuCount) * 100.0, ratio * Double(cpuCount) * 100.0)
+                cpuPercent = min(100.0, ratio * 100.0)
             }
 
             let rssBytes = UInt64(parsed.rssPages) * pageSize
