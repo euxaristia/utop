@@ -439,10 +439,11 @@ final class Sampler {
     private func readMemory() -> MemorySnapshot {
         if !checkedRamSpeed {
             checkedRamSpeed = true
+            // 1. Try udevadm info (fast, no root, modern kernels/udev)
             let pipe = Pipe()
             let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/dmidecode")
-            process.arguments = ["-t", "memory"]
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/udevadm")
+            process.arguments = ["info", "--query=property", "--path=/sys/devices/virtual/dmi/id/"]
             process.standardOutput = pipe
             do {
                 try process.run()
@@ -450,17 +451,46 @@ final class Sampler {
                 let data = pipe.fileHandleForReading.readDataToEndOfFile()
                 if let output = String(data: data, encoding: .utf8) {
                     let lines = output.split(separator: "\n")
+                    var maxSpeed = 0
                     for line in lines {
-                        if line.contains("Speed:") && !line.contains("Unknown") && !line.contains("Configured") {
-                            let parts = line.split(separator: ":")
-                            if parts.count >= 2 {
-                                cachedRamSpeed = parts[1].trimmingCharacters(in: .whitespacesAndNewlines)
-                                break
+                        if line.contains("SPEED_MTS=") {
+                            let parts = line.split(separator: "=")
+                            if parts.count >= 2, let s = Int(parts[1]) {
+                                maxSpeed = max(maxSpeed, s)
                             }
                         }
                     }
+                    if maxSpeed > 0 {
+                        cachedRamSpeed = "\(maxSpeed) MT/s"
+                    }
                 }
             } catch {}
+
+            // 2. Fallback to dmidecode if udevadm failed
+            if cachedRamSpeed == nil {
+                let pipe = Pipe()
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: "/usr/bin/dmidecode")
+                process.arguments = ["-t", "memory"]
+                process.standardOutput = pipe
+                do {
+                    try process.run()
+                    process.waitUntilExit()
+                    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                    if let output = String(data: data, encoding: .utf8) {
+                        let lines = output.split(separator: "\n")
+                        for line in lines {
+                            if line.contains("Speed:") && !line.contains("Unknown") && !line.contains("Configured") {
+                                let parts = line.split(separator: ":")
+                                if parts.count >= 2 {
+                                    cachedRamSpeed = parts[1].trimmingCharacters(in: .whitespacesAndNewlines)
+                                    break
+                                }
+                            }
+                        }
+                    }
+                } catch {}
+            }
         }
 
         guard let text = try? String(contentsOfFile: "/proc/meminfo", encoding: .utf8) else {
