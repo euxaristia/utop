@@ -244,7 +244,40 @@ final class Sampler {
     }
 
     private func readGpu() -> GpuSnapshot? {
-        // 1. Check for AMD / DRM / generic sysfs percentage
+        // 1. NVIDIA via nvidia-smi (High priority for NVIDIA)
+        // Check if we have an NVIDIA card in DRM first or just try nvidia-smi
+        let now = Date()
+        if now.timeIntervalSince(lastNvidiaSampleAt) >= 0.8 { // slightly faster than 1s to ensure it updates
+            lastNvidiaSampleAt = now
+            let pipe = Pipe()
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/nvidia-smi")
+            process.arguments = ["--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu", "--format=csv,noheader,nounits"]
+            process.standardOutput = pipe
+            
+            do {
+                try process.run()
+                process.waitUntilExit()
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                if let output = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) {
+                    let parts = output.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+                    if parts.count >= 4 {
+                        let usage = Double(parts[0])
+                        let used = UInt64(parts[1]).map { $0 * 1024 * 1024 }
+                        let total = UInt64(parts[2]).map { $0 * 1024 * 1024 }
+                        let temp = Double(parts[3])
+                        lastNvidiaGpu = GpuSnapshot(name: "NVIDIA GPU", usage: usage, memUsed: used, memTotal: total, temp: temp)
+                        return lastNvidiaGpu
+                    }
+                }
+            } catch {
+                // nvidia-smi likely not found or failed, fall through to sysfs
+            }
+        } else if lastNvidiaGpu != nil {
+            return lastNvidiaGpu
+        }
+
+        // 2. Check for AMD / DRM / generic sysfs percentage
         if let dir = opendir("/sys/class/drm") {
             defer { closedir(dir) }
             while let entry = readdir(dir) {
@@ -330,7 +363,7 @@ final class Sampler {
             }
         }
         
-        // 2. Adreno / kgsl (Android/Linux handhelds)
+        // 3. Adreno / kgsl (Android/Linux handhelds)
         let adrenoPaths = [
             "/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage",
             "/sys/class/kgsl/kgsl-3d0/gpubusy"
@@ -357,35 +390,6 @@ final class Sampler {
                     }
                     return GpuSnapshot(name: "Adreno GPU", usage: u, memUsed: nil, memTotal: nil, temp: aTemp)
                 }
-            }
-        }
-        
-        // 3. NVIDIA via nvidia-smi (as a fallback since it's not in sysfs)
-        let now = Date()
-        if now.timeIntervalSince(lastNvidiaSampleAt) >= 1.0 {
-            lastNvidiaSampleAt = now
-            let pipe = Pipe()
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/nvidia-smi")
-            process.arguments = ["--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu", "--format=csv,noheader,nounits"]
-            process.standardOutput = pipe
-            
-            do {
-                try process.run()
-                process.waitUntilExit()
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                if let output = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) {
-                    let parts = output.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
-                    if parts.count >= 4 {
-                        let usage = Double(parts[0])
-                        let used = UInt64(parts[1]).map { $0 * 1024 * 1024 } // MiB to bytes
-                        let total = UInt64(parts[2]).map { $0 * 1024 * 1024 } // MiB to bytes
-                        let temp = Double(parts[3])
-                        lastNvidiaGpu = GpuSnapshot(name: "NVIDIA GPU", usage: usage, memUsed: used, memTotal: total, temp: temp)
-                    }
-                }
-            } catch {
-                // nvidia-smi likely not found or failed
             }
         }
         
