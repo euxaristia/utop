@@ -29,7 +29,7 @@ const MAX_NET_HISTORY: usize = 180;
 const MIN_TICK_MS: u64 = 200;
 const MAX_TICK_MS: u64 = 5000;
 const TICK_STEP_MS: u64 = 100;
-const MAX_FRAME_MS: u64 = 33;
+const MAX_FRAME_MS: u64 = 50;
 
 const SIGNAL_OPTIONS: [(&str, &str); 6] = [
     ("TERM", "-TERM"),
