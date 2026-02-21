@@ -56,6 +56,7 @@ struct CpuTimes {
 struct MemorySnapshot {
     let usedBytes: UInt64
     let totalBytes: UInt64
+    let ramSpeed: String?
 
     var usedPercent: Double {
         guard totalBytes > 0 else { return 0.0 }
@@ -168,6 +169,8 @@ final class Sampler {
 
     private var lastNvidiaSampleAt: Date = Date.distantPast
     private var lastNvidiaGpu: GpuSnapshot?
+    private var cachedRamSpeed: String?
+    private var checkedRamSpeed = false
 
     func sample(sortMode: SortMode, filter: String) -> (Double, Double?, MemorySnapshot, NetworkSnapshot, GpuSnapshot?, [ProcessInfo], Int) {
         let now = Date()
@@ -434,10 +437,36 @@ final class Sampler {
     }
 
     private func readMemory() -> MemorySnapshot {
-        guard let text = try? String(contentsOfFile: "/proc/meminfo", encoding: .utf8) else {
-            return MemorySnapshot(usedBytes: 0, totalBytes: 0)
+        if !checkedRamSpeed {
+            checkedRamSpeed = true
+            let pipe = Pipe()
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/dmidecode")
+            process.arguments = ["-t", "memory"]
+            process.standardOutput = pipe
+            do {
+                try process.run()
+                process.waitUntilExit()
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                if let output = String(data: data, encoding: .utf8) {
+                    let lines = output.split(separator: "\n")
+                    for line in lines {
+                        if line.contains("Speed:") && !line.contains("Unknown") && !line.contains("Configured") {
+                            let parts = line.split(separator: ":")
+                            if parts.count >= 2 {
+                                cachedRamSpeed = parts[1].trimmingCharacters(in: .whitespacesAndNewlines)
+                                break
+                            }
+                        }
+                    }
+                }
+            } catch {}
         }
 
+        guard let text = try? String(contentsOfFile: "/proc/meminfo", encoding: .utf8) else {
+            return MemorySnapshot(usedBytes: 0, totalBytes: 0, ramSpeed: cachedRamSpeed)
+        }
+        
         var totalKB: UInt64 = 0
         var availableKB: UInt64 = 0
 
@@ -451,7 +480,7 @@ final class Sampler {
 
         let total = totalKB * 1024
         let used = total > (availableKB * 1024) ? total - (availableKB * 1024) : 0
-        return MemorySnapshot(usedBytes: used, totalBytes: total)
+        return MemorySnapshot(usedBytes: used, totalBytes: total, ramSpeed: cachedRamSpeed)
     }
 
     private func parseMeminfoKB(_ line: Substring) -> UInt64 {
@@ -704,7 +733,9 @@ func render(
     
     let cpuTempStr = cpuTemp.map { String(format: " %4.1f°C", $0) } ?? ""
     appendLine(&out, "CPU: \(String(format: "%5.1f", cpu))%\(cpuTempStr)")
-    appendLine(&out, "MEM: \(String(format: "%5.1f", memory.usedPercent))%  \(humanBytes(memory.usedBytes)) / \(humanBytes(memory.totalBytes))")
+    
+    let speedStr = memory.ramSpeed.map { " @ \($0)" } ?? ""
+    appendLine(&out, "MEM: \(String(format: "%5.1f", memory.usedPercent))%  \(humanBytes(memory.usedBytes)) / \(humanBytes(memory.totalBytes))\(speedStr)")
     
     if let g = gpu {
         let usageStr = g.usage.map { String(format: "%5.1f%%", $0) } ?? " - %"
