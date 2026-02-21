@@ -1,49 +1,47 @@
-# rtop
+# rtop (Swift)
 
-A balanced system monitor written in Rust, designed to fill the niche between the feature-richness of `btop` and the simplicity of `htop`.
+`rtop` is now a pure Swift terminal system monitor for Linux.
 
-[![GitHub Repository](https://img.shields.io/badge/GitHub-rtop-blue?logo=github)](https://github.com/euxaristia/rtop)
-[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
-[![Built with Rust](https://img.shields.io/badge/Built%20with-Rust-orange?logo=rust)](https://www.rust-lang.org/)
-[![Platform](https://img.shields.io/badge/Platform-Linux-lightgrey?logo=linux)](https://github.com/euxaristia/rtop)
+- No third-party libraries.
+- Data source is Linux `/proc`.
+- Rendering is ANSI terminal output.
 
 ## Features
 
-- **CPU Monitoring**: Real-time usage gauge and a history sparkline.
-- **Memory Tracking**: Visual representation of used vs. total memory with percentage.
-- **Process Management**: Interactive list of processes sorted by CPU usage.
-- **Responsive TUI**: Built with [Ratatui](https://ratatui.rs/) for a modern terminal experience.
+- Real-time CPU usage
+- Memory usage (`MemTotal` / `MemAvailable`)
+- Network throughput (auto-selects busiest non-loopback interface)
+- Process table sorted by CPU%
+- Keyboard navigation for process selection
 
-## Installation
+## Requirements
 
-### From Source
+- Linux
+- Swift toolchain (SwiftPM)
 
-Ensure you have [Rust](https://www.rust-lang.org/tools/install) installed.
+## Build
 
 ```bash
-git clone https://github.com/euxaristia/rtop.git
-cd rtop
-cargo install --path .
+swift build -c release
 ```
 
-By default, this installs the binary to `~/.cargo/bin`. See [Installation to ~/.local](#installation-to-local) for other options.
+## Run
+
+```bash
+swift run -c release rtop
+```
 
 ## Controls
 
-- `q`: Quit the application
-- `↑` / `k`: Scroll up in the process list
-- `↓` / `j`: Scroll down in the process list
+- `q`: quit
+- `j` / `↓`: move selection down
+- `k` / `↑`: move selection up
 
-## Installation to ~/.local
+## Notes
 
-To install `rtop` directly to `~/.local/bin`, use the `--root` flag:
-
-```bash
-cargo install --path . --root ~/.local
-```
-
-*Note: Ensure `~/.local/bin` is in your `$PATH`.*
+- This implementation intentionally uses only Swift stdlib/Foundation and Linux system APIs.
+- No external package dependencies are used.
 
 ## License
 
-Licensed under the [GNU General Public License v3.0](LICENSE).
+Licensed under [GNU GPL v3.0](LICENSE).
