@@ -20,8 +20,8 @@ use std::{
     time::{Duration, Instant},
 };
 use sysinfo::{
-    CpuRefreshKind, Disks, Networks, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind,
-    Users,
+    CpuRefreshKind, Disks, LoadAvg, Networks, ProcessRefreshKind, ProcessesToUpdate, System,
+    UpdateKind, Users,
 };
 
 const MAX_CPU_HISTORY: usize = 240;
@@ -77,12 +77,14 @@ struct ProcessRowData {
     name_lc: String,
     command: String,
     user: String,
-    threads: usize,
     cpu_raw_percent: f32,
     cpu_total_percent: f32,
     mem_percent: f64,
-    mem_bytes: u64,
     tree_prefix: String,
+    threads_text: String,
+    mem_text: String,
+    cpu_cell_per_core: String,
+    cpu_cell_total: String,
 }
 
 impl ProcessRowData {
@@ -151,6 +153,9 @@ struct App {
     status_msg: String,
     dirty: bool,
     last_table_visible_rows: usize,
+    avg_freq_mhz: u64,
+    load_avg: LoadAvg,
+    uptime_secs: u64,
 }
 
 impl App {
@@ -194,6 +199,13 @@ impl App {
             status_msg: String::new(),
             dirty: true,
             last_table_visible_rows: 24,
+            avg_freq_mhz: 0,
+            load_avg: LoadAvg {
+                one: 0.0,
+                five: 0.0,
+                fifteen: 0.0,
+            },
+            uptime_secs: 0,
         };
         app.update();
         app
@@ -238,6 +250,13 @@ impl App {
             .iter()
             .map(|cpu| cpu.cpu_usage().clamp(0.0, 100.0))
             .collect();
+        self.avg_freq_mhz = if self.system.cpus().is_empty() {
+            0
+        } else {
+            self.system.cpus().iter().map(|c| c.frequency()).sum::<u64>() / self.cpu_count as u64
+        };
+        self.load_avg = System::load_average();
+        self.uptime_secs = System::uptime();
 
         let cpu_usage = self.system.global_cpu_usage().clamp(0.0, 100.0);
         self.cpu_history.push_back(cpu_usage as u64);
@@ -253,6 +272,12 @@ impl App {
                 .values()
                 .map(|p| {
                     let name = trim_text(&p.name().to_string_lossy(), 18);
+                    let threads = p.tasks().map_or(1, |tasks| tasks.len().max(1));
+                    let cpu_usage =
+                        p.cpu_usage()
+                            .clamp(0.0, (self.cpu_count as f32 * 100.0).max(100.0));
+                    let cpu_total_percent = (cpu_usage / self.cpu_count as f32).clamp(0.0, 100.0);
+                    let mem_bytes = p.memory();
                     ProcessRowData {
                         pid: p.pid().to_string(),
                         pid_num: p.pid().as_u32(),
@@ -273,15 +298,22 @@ impl App {
                             })
                             .or_else(|| p.user_id().map(|uid| uid.to_string()))
                             .unwrap_or_else(|| "-".to_string()),
-                        threads: p.tasks().map_or(1, |tasks| tasks.len().max(1)),
-                        cpu_raw_percent: p
-                            .cpu_usage()
-                            .clamp(0.0, (self.cpu_count as f32 * 100.0).max(100.0)),
-                        cpu_total_percent: (p.cpu_usage() / self.cpu_count as f32)
-                            .clamp(0.0, 100.0),
-                        mem_percent: (p.memory() as f64 / total_mem * 100.0).clamp(0.0, 100.0),
-                        mem_bytes: p.memory(),
+                        cpu_raw_percent: cpu_usage,
+                        cpu_total_percent,
+                        mem_percent: (mem_bytes as f64 / total_mem * 100.0).clamp(0.0, 100.0),
                         tree_prefix: String::new(),
+                        threads_text: threads.to_string(),
+                        mem_text: format!("{:>6}", human_bytes(mem_bytes)),
+                        cpu_cell_per_core: format!(
+                            "{} {:>4.1}",
+                            bar(cpu_total_percent, 5),
+                            cpu_total_percent
+                        ),
+                        cpu_cell_total: format!(
+                            "{} {:>4.1}",
+                            bar((cpu_usage / self.cpu_count as f32).clamp(0.0, 100.0), 5),
+                            cpu_usage
+                        ),
                     }
                 })
                 .collect();
@@ -375,6 +407,7 @@ impl App {
             }
         }
         self.clamp_selection();
+        self.dirty = true;
     }
 
     fn process_count(&self) -> usize {
@@ -399,37 +432,57 @@ impl App {
     fn next_process(&mut self) {
         let count = self.process_count();
         if count > 0 {
-            self.selected_process = (self.selected_process + 1).min(count - 1);
+            let next = (self.selected_process + 1).min(count - 1);
+            if next != self.selected_process {
+                self.selected_process = next;
+                self.dirty = true;
+            }
         }
     }
 
     fn previous_process(&mut self) {
         if self.process_count() > 0 {
-            self.selected_process = self.selected_process.saturating_sub(1);
+            let next = self.selected_process.saturating_sub(1);
+            if next != self.selected_process {
+                self.selected_process = next;
+                self.dirty = true;
+            }
         }
     }
 
     fn page_down(&mut self, page_size: usize) {
         let count = self.process_count();
         if count > 0 {
-            self.selected_process = (self.selected_process + page_size.max(1)).min(count - 1);
+            let next = (self.selected_process + page_size.max(1)).min(count - 1);
+            if next != self.selected_process {
+                self.selected_process = next;
+                self.dirty = true;
+            }
         }
     }
 
     fn page_up(&mut self, page_size: usize) {
         if self.process_count() > 0 {
-            self.selected_process = self.selected_process.saturating_sub(page_size.max(1));
+            let next = self.selected_process.saturating_sub(page_size.max(1));
+            if next != self.selected_process {
+                self.selected_process = next;
+                self.dirty = true;
+            }
         }
     }
 
     fn jump_top(&mut self) {
-        self.selected_process = 0;
+        if self.selected_process != 0 {
+            self.selected_process = 0;
+            self.dirty = true;
+        }
     }
 
     fn jump_bottom(&mut self) {
         let count = self.process_count();
-        if count > 0 {
+        if count > 0 && self.selected_process != count - 1 {
             self.selected_process = count - 1;
+            self.dirty = true;
         }
     }
 
@@ -465,13 +518,19 @@ impl App {
     fn speed_up_refresh(&mut self) {
         let ms = self.tick_rate.as_millis() as u64;
         let next = ms.saturating_sub(TICK_STEP_MS).max(MIN_TICK_MS);
-        self.tick_rate = Duration::from_millis(next);
+        if next != ms {
+            self.tick_rate = Duration::from_millis(next);
+            self.dirty = true;
+        }
     }
 
     fn slow_down_refresh(&mut self) {
         let ms = self.tick_rate.as_millis() as u64;
         let next = (ms + TICK_STEP_MS).min(MAX_TICK_MS);
-        self.tick_rate = Duration::from_millis(next);
+        if next != ms {
+            self.tick_rate = Duration::from_millis(next);
+            self.dirty = true;
+        }
     }
 
     fn toggle_per_core(&mut self) {
@@ -694,7 +753,6 @@ where
                                     }
                                     _ => {}
                                 }
-                                app.dirty = true;
                             }
                         }
                     }
@@ -729,14 +787,8 @@ fn ui(f: &mut Frame, app: &mut App) {
         .split(f.area());
 
     let cpu_usage = app.system.global_cpu_usage().clamp(0.0, 100.0);
-    let load = System::load_average();
+    let load = &app.load_avg;
     let refresh_ms = app.tick_rate.as_millis().min(9999);
-    let avg_freq_mhz = if app.system.cpus().is_empty() {
-        0
-    } else {
-        app.system.cpus().iter().map(|c| c.frequency()).sum::<u64>()
-            / app.system.cpus().len() as u64
-    };
 
     let top_block = Block::default()
         .borders(Borders::ALL)
@@ -744,7 +796,7 @@ fn ui(f: &mut Frame, app: &mut App) {
         .border_style(Style::default().fg(Color::DarkGray));
     f.render_widget(top_block.clone(), root[0]);
     let top_inner = top_block.inner(root[0]);
-    let uptime = System::uptime();
+    let uptime = app.uptime_secs;
     f.render_widget(
         Paragraph::new(format!("up {}h {}m", uptime / 3600, (uptime % 3600) / 60))
             .style(Style::default().fg(Color::Gray)),
@@ -780,10 +832,10 @@ fn ui(f: &mut Frame, app: &mut App) {
             width: graph_width,
             height: top_inner.height,
         };
-        let history = app.cpu_history.iter().copied().collect::<Vec<_>>();
+        let history = app.cpu_history.make_contiguous();
         f.render_widget(
             Sparkline::default()
-                .data(&history)
+                .data(history.iter())
                 .max(100)
                 .style(Style::default().fg(Color::Green)),
             graph,
@@ -799,7 +851,7 @@ fn ui(f: &mut Frame, app: &mut App) {
         "CPU {:<12} {:>5.1}% {:>4.1} GHz",
         bar(cpu_usage, 8),
         cpu_usage,
-        avg_freq_mhz as f64 / 1000.0
+        app.avg_freq_mhz as f64 / 1000.0
     )];
     for (i, u) in app.core_usages.iter().enumerate() {
         lines.push(format!("C{:<2} {:<18} {:>5.1}%", i, bar(*u, 12), u));
@@ -918,24 +970,28 @@ fn ui(f: &mut Frame, app: &mut App) {
             Constraint::Min(5),
         ])
         .split(net_inner);
-    let rx_hist = app.net_rx_history.iter().copied().collect::<Vec<_>>();
-    let tx_hist = app.net_tx_history.iter().copied().collect::<Vec<_>>();
-    let rx_max = rx_hist.iter().copied().max().unwrap_or(1).max(1);
-    let tx_max = tx_hist.iter().copied().max().unwrap_or(1).max(1);
-    f.render_widget(
-        Sparkline::default()
-            .data(&rx_hist)
-            .max(rx_max)
-            .style(Style::default().fg(Color::Cyan)),
-        net_chunks[0],
-    );
-    f.render_widget(
-        Sparkline::default()
-            .data(&tx_hist)
-            .max(tx_max)
-            .style(Style::default().fg(Color::Green)),
-        net_chunks[1],
-    );
+    {
+        let rx_hist = app.net_rx_history.make_contiguous();
+        let rx_max = rx_hist.iter().copied().max().unwrap_or(1).max(1);
+        f.render_widget(
+            Sparkline::default()
+                .data(rx_hist.iter())
+                .max(rx_max)
+                .style(Style::default().fg(Color::Cyan)),
+            net_chunks[0],
+        );
+    }
+    {
+        let tx_hist = app.net_tx_history.make_contiguous();
+        let tx_max = tx_hist.iter().copied().max().unwrap_or(1).max(1);
+        f.render_widget(
+            Sparkline::default()
+                .data(tx_hist.iter())
+                .max(tx_max)
+                .style(Style::default().fg(Color::Green)),
+            net_chunks[1],
+        );
+    }
     f.render_widget(
         Paragraph::new(format!(
             "download {:>8}/s {:<16}\nup top  {:>8}/s\n\ntotal rx {:>10}\n\nupload   {:>8}/s {:<16}\nup top  {:>8}/s\n\ntotal tx {:>10}",
@@ -1034,12 +1090,6 @@ fn ui(f: &mut Frame, app: &mut App) {
             if absolute_index == app.selected_process {
                 row_style = Style::default().fg(Color::Black).bg(Color::Yellow);
             }
-            let cpu_pct = p.display_cpu(app.per_core);
-            let cpu_bar_pct = if app.per_core {
-                cpu_pct
-            } else {
-                (cpu_pct / app.cpu_count as f32).clamp(0.0, 100.0)
-            };
             Row::new(vec![
                 Cell::from(p.pid.clone()),
                 Cell::from(if app.tree_mode {
@@ -1052,10 +1102,14 @@ fn ui(f: &mut Frame, app: &mut App) {
                 } else {
                     p.command.clone()
                 }),
-                Cell::from(format!("{}", p.threads)),
+                Cell::from(p.threads_text.clone()),
                 Cell::from(p.user.clone()),
-                Cell::from(format!("{:>6}", human_bytes(p.mem_bytes))),
-                Cell::from(format!("{} {:>4.1}", bar(cpu_bar_pct, 5), cpu_pct)),
+                Cell::from(p.mem_text.clone()),
+                Cell::from(if app.per_core {
+                    p.cpu_cell_per_core.clone()
+                } else {
+                    p.cpu_cell_total.clone()
+                }),
             ])
             .style(row_style)
         });
