@@ -56,10 +56,25 @@ struct CpuTimes {
 struct MemorySnapshot {
     let usedBytes: UInt64
     let totalBytes: UInt64
+    let swapUsedBytes: UInt64
+    let swapTotalBytes: UInt64
+
+    var combinedUsed: UInt64 { usedBytes + swapUsedBytes }
+    var combinedTotal: UInt64 { totalBytes + swapTotalBytes }
 
     var usedPercent: Double {
         guard totalBytes > 0 else { return 0.0 }
         return min(100.0, (Double(usedBytes) / Double(totalBytes)) * 100.0)
+    }
+
+    var swapPercent: Double {
+        guard swapTotalBytes > 0 else { return 0.0 }
+        return min(100.0, (Double(swapUsedBytes) / Double(swapTotalBytes)) * 100.0)
+    }
+
+    var combinedPercent: Double {
+        guard combinedTotal > 0 else { return 0.0 }
+        return min(100.0, (Double(combinedUsed) / Double(combinedTotal)) * 100.0)
     }
 }
 
@@ -523,23 +538,31 @@ final class Sampler {
 
     private func readMemory() -> MemorySnapshot {
         guard let text = try? String(contentsOfFile: "/proc/meminfo", encoding: .utf8) else {
-            return MemorySnapshot(usedBytes: 0, totalBytes: 0)
+            return MemorySnapshot(usedBytes: 0, totalBytes: 0, swapUsedBytes: 0, swapTotalBytes: 0)
         }
         
         var totalKB: UInt64 = 0
         var availableKB: UInt64 = 0
+        var swapTotalKB: UInt64 = 0
+        var swapFreeKB: UInt64 = 0
 
         for line in text.split(separator: "\n") {
             if line.hasPrefix("MemTotal:") {
                 totalKB = parseMeminfoKB(line)
             } else if line.hasPrefix("MemAvailable:") {
                 availableKB = parseMeminfoKB(line)
+            } else if line.hasPrefix("SwapTotal:") {
+                swapTotalKB = parseMeminfoKB(line)
+            } else if line.hasPrefix("SwapFree:") {
+                swapFreeKB = parseMeminfoKB(line)
             }
         }
 
         let total = totalKB * 1024
         let used = total > (availableKB * 1024) ? total - (availableKB * 1024) : 0
-        return MemorySnapshot(usedBytes: used, totalBytes: total)
+        let swapTotal = swapTotalKB * 1024
+        let swapUsed = swapTotal > (swapFreeKB * 1024) ? swapTotal - (swapFreeKB * 1024) : 0
+        return MemorySnapshot(usedBytes: used, totalBytes: total, swapUsedBytes: swapUsed, swapTotalBytes: swapTotal)
     }
 
     private func parseMeminfoKB(_ line: Substring) -> UInt64 {
@@ -752,7 +775,7 @@ func render(
     isSearching: Bool
 ) {
     let size = termSize()
-    let headerLines = 9
+    let headerLines = 10
     let tableStart = headerLines + 2
     let visibleRows = max(5, size.rows - tableStart - 2)
 
@@ -787,7 +810,8 @@ func render(
     let cpuTempStr = cpuTemp.map { String(format: " %4.1f°C", $0) } ?? ""
     appendLine(&out, "CPU: \(String(format: "%5.1f", cpu))%\(cpuTempStr)")
     
-    appendLine(&out, "MEM: \(String(format: "%5.1f", memory.usedPercent))%  \(humanBytes(memory.usedBytes)) / \(humanBytes(memory.totalBytes))")
+    appendLine(&out, "MEM: \(String(format: "%5.1f", memory.combinedPercent))%  \(humanBytes(memory.combinedUsed)) / \(humanBytes(memory.combinedTotal))")
+    appendLine(&out, "SWP: \(String(format: "%5.1f", memory.swapPercent))%  \(humanBytes(memory.swapUsedBytes)) / \(humanBytes(memory.swapTotalBytes))")
     
     if let g = gpu {
         let usageStr = g.usage.map { String(format: "%5.1f%%", $0) } ?? " - %"
