@@ -12,7 +12,7 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Sparkline, Table},
 };
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     io,
     net::UdpSocket,
     path::Path,
@@ -81,6 +81,7 @@ struct ProcessRowData {
     cpu_total_percent: f32,
     mem_percent: f64,
     mem_bytes: u64,
+    tree_prefix: String,
 }
 
 impl ProcessRowData {
@@ -275,6 +276,7 @@ impl App {
                             .clamp(0.0, 100.0),
                         mem_percent: (p.memory() as f64 / total_mem * 100.0).clamp(0.0, 100.0),
                         mem_bytes: p.memory(),
+                        tree_prefix: String::new(),
                     }
                 })
                 .collect();
@@ -338,13 +340,7 @@ impl App {
             .collect();
 
         if self.tree_mode {
-            rows.sort_by(|a, b| {
-                a.parent_pid
-                    .unwrap_or(a.pid_num)
-                    .cmp(&b.parent_pid.unwrap_or(b.pid_num))
-                    .then_with(|| a.parent_pid.is_some().cmp(&b.parent_pid.is_some()))
-                    .then_with(|| a.pid_num.cmp(&b.pid_num))
-            });
+            rows = tree_order_rows(rows);
         } else {
             rows.sort_by(|a, b| match self.sort_mode {
                 SortMode::Cpu => b
@@ -481,6 +477,7 @@ impl App {
     fn toggle_tree_mode(&mut self) {
         self.tree_mode = !self.tree_mode;
         self.status_msg = format!("tree {}", if self.tree_mode { "on" } else { "off" });
+        self.rebuild_process_rows();
     }
 
     fn toggle_proc_lazy(&mut self) {
@@ -1018,8 +1015,8 @@ fn ui(f: &mut Frame, app: &mut App) {
             };
             Row::new(vec![
                 Cell::from(p.pid.clone()),
-                Cell::from(if app.tree_mode && p.parent_pid.is_some() {
-                    format!("└ {}", p.name)
+                Cell::from(if app.tree_mode {
+                    format!("{}{}", p.tree_prefix, p.name)
                 } else {
                     p.name.clone()
                 }),
@@ -1166,6 +1163,91 @@ fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
         y,
         width,
         height: h,
+    }
+}
+
+fn tree_order_rows(rows: Vec<ProcessRowData>) -> Vec<ProcessRowData> {
+    let mut by_pid: HashMap<u32, ProcessRowData> =
+        rows.into_iter().map(|row| (row.pid_num, row)).collect();
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut roots: Vec<u32> = Vec::new();
+
+    for row in by_pid.values() {
+        if let Some(parent) = row.parent_pid {
+            if parent != row.pid_num && by_pid.contains_key(&parent) {
+                children.entry(parent).or_default().push(row.pid_num);
+            } else {
+                roots.push(row.pid_num);
+            }
+        } else {
+            roots.push(row.pid_num);
+        }
+    }
+
+    roots.sort_unstable();
+    roots.dedup();
+    for siblings in children.values_mut() {
+        siblings.sort_unstable();
+    }
+
+    let mut ordered = Vec::with_capacity(by_pid.len());
+    for root in roots {
+        walk_tree(root, "", true, &children, &mut by_pid, &mut ordered);
+    }
+
+    if !by_pid.is_empty() {
+        let mut leftovers: Vec<u32> = by_pid.keys().copied().collect();
+        leftovers.sort_unstable();
+        for pid in leftovers {
+            walk_tree(pid, "", true, &children, &mut by_pid, &mut ordered);
+        }
+    }
+
+    ordered
+}
+
+fn walk_tree(
+    pid: u32,
+    parent_prefix: &str,
+    is_last: bool,
+    children: &HashMap<u32, Vec<u32>>,
+    by_pid: &mut HashMap<u32, ProcessRowData>,
+    ordered: &mut Vec<ProcessRowData>,
+) {
+    let Some(mut row) = by_pid.remove(&pid) else {
+        return;
+    };
+
+    let has_parent = row.parent_pid.is_some_and(|p| p != pid);
+    row.tree_prefix = if has_parent {
+        format!("{}{}", parent_prefix, if is_last { "└─ " } else { "├─ " })
+    } else {
+        String::new()
+    };
+    ordered.push(row);
+
+    if let Some(kids) = children.get(&pid) {
+        let child_prefix = if has_parent {
+            format!("{}{}", parent_prefix, if is_last { "   " } else { "│  " })
+        } else {
+            String::new()
+        };
+        let mut present_kids = kids
+            .iter()
+            .copied()
+            .filter(|child_pid| by_pid.contains_key(child_pid))
+            .collect::<Vec<_>>();
+        let last = present_kids.len().saturating_sub(1);
+        for (idx, child_pid) in present_kids.drain(..).enumerate() {
+            walk_tree(
+                child_pid,
+                &child_prefix,
+                idx == last,
+                children,
+                by_pid,
+                ordered,
+            );
+        }
     }
 }
 
