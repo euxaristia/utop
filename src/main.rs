@@ -1,9 +1,9 @@
-use color_eyre::Result;
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+type AppResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -21,7 +21,7 @@ use std::{
 };
 use sysinfo::{
     CpuRefreshKind, Disks, LoadAvg, Networks, ProcessRefreshKind, ProcessesToUpdate, System,
-    UpdateKind, Users,
+    UpdateKind,
 };
 
 const MAX_CPU_HISTORY: usize = 240;
@@ -29,7 +29,9 @@ const MAX_NET_HISTORY: usize = 180;
 const MIN_TICK_MS: u64 = 200;
 const MAX_TICK_MS: u64 = 5000;
 const TICK_STEP_MS: u64 = 100;
-const MAX_FRAME_MS: u64 = 50;
+const TARGET_FPS: u64 = 60;
+const FRAME_BUDGET_NS: u64 = 1_000_000_000 / TARGET_FPS;
+const MAX_INPUT_EVENTS_PER_CYCLE: usize = 64;
 
 const SIGNAL_OPTIONS: [(&str, &str); 6] = [
     ("TERM", "-TERM"),
@@ -119,7 +121,6 @@ struct App {
     system: System,
     disks: Disks,
     networks: Networks,
-    users: Users,
     last_tick: Instant,
     tick_rate: Duration,
     cpu_count: usize,
@@ -149,7 +150,6 @@ struct App {
     last_disk_refresh: Instant,
     last_process_refresh: Instant,
     last_ip_refresh: Instant,
-    last_user_refresh: Instant,
     modal: Option<ModalState>,
     status_msg: String,
     dirty: bool,
@@ -160,6 +160,7 @@ struct App {
     last_input: Instant,
     perf_update_ms_ema: f64,
     perf_draw_ms_ema: f64,
+    pending_scroll: i32,
 }
 
 impl App {
@@ -168,7 +169,6 @@ impl App {
             system: System::new_all(),
             disks: Disks::new_with_refreshed_list(),
             networks: Networks::new_with_refreshed_list(),
-            users: Users::new_with_refreshed_list(),
             last_tick: Instant::now(),
             tick_rate: Duration::from_millis(1000),
             cpu_count: 1,
@@ -198,7 +198,6 @@ impl App {
             last_disk_refresh: Instant::now(),
             last_process_refresh: Instant::now(),
             last_ip_refresh: Instant::now() - Duration::from_secs(30),
-            last_user_refresh: Instant::now() - Duration::from_secs(30),
             modal: None,
             status_msg: String::new(),
             dirty: true,
@@ -213,6 +212,7 @@ impl App {
             last_input: Instant::now(),
             perf_update_ms_ema: 0.0,
             perf_draw_ms_ema: 0.0,
+            pending_scroll: 0,
         };
         app.update();
         app
@@ -237,7 +237,6 @@ impl App {
                 ProcessRefreshKind::nothing()
                     .with_cpu()
                     .with_memory()
-                    .with_user(UpdateKind::OnlyIfNotSet)
                     .with_cmd(UpdateKind::OnlyIfNotSet)
                     .without_tasks(),
             );
@@ -247,10 +246,6 @@ impl App {
         if self.last_disk_refresh.elapsed() >= Duration::from_secs(5) {
             self.disks.refresh(false);
             self.last_disk_refresh = Instant::now();
-        }
-        if self.last_user_refresh.elapsed() >= Duration::from_secs(20) {
-            self.users.refresh();
-            self.last_user_refresh = Instant::now();
         }
         self.networks.refresh(true);
         self.cpu_count = self.system.cpus().len().max(1);
@@ -303,10 +298,7 @@ impl App {
                             .join(" "),
                         user: p
                             .user_id()
-                            .and_then(|uid| {
-                                self.users.get_user_by_id(uid).map(|u| u.name().to_string())
-                            })
-                            .or_else(|| p.user_id().map(|uid| uid.to_string()))
+                            .map(|uid| uid.to_string())
                             .unwrap_or_else(|| "-".to_string()),
                         cpu_raw_percent: cpu_usage,
                         cpu_total_percent,
@@ -447,48 +439,6 @@ impl App {
         }
     }
 
-    fn next_process(&mut self) {
-        let count = self.process_count();
-        if count > 0 {
-            let next = (self.selected_process + 1).min(count - 1);
-            if next != self.selected_process {
-                self.selected_process = next;
-                self.dirty = true;
-            }
-        }
-    }
-
-    fn previous_process(&mut self) {
-        if self.process_count() > 0 {
-            let next = self.selected_process.saturating_sub(1);
-            if next != self.selected_process {
-                self.selected_process = next;
-                self.dirty = true;
-            }
-        }
-    }
-
-    fn page_down(&mut self, page_size: usize) {
-        let count = self.process_count();
-        if count > 0 {
-            let next = (self.selected_process + page_size.max(1)).min(count - 1);
-            if next != self.selected_process {
-                self.selected_process = next;
-                self.dirty = true;
-            }
-        }
-    }
-
-    fn page_up(&mut self, page_size: usize) {
-        if self.process_count() > 0 {
-            let next = self.selected_process.saturating_sub(page_size.max(1));
-            if next != self.selected_process {
-                self.selected_process = next;
-                self.dirty = true;
-            }
-        }
-    }
-
     fn jump_top(&mut self) {
         if self.selected_process != 0 {
             self.selected_process = 0;
@@ -500,6 +450,31 @@ impl App {
         let count = self.process_count();
         if count > 0 && self.selected_process != count - 1 {
             self.selected_process = count - 1;
+            self.dirty = true;
+        }
+    }
+
+    fn queue_scroll(&mut self, delta: i32) {
+        self.pending_scroll = self.pending_scroll.saturating_add(delta).clamp(-100_000, 100_000);
+        self.dirty = true;
+    }
+
+    fn flush_pending_scroll(&mut self, max_step: usize) {
+        if self.pending_scroll == 0 || self.process_count() == 0 || max_step == 0 {
+            return;
+        }
+        let step = max_step as i32;
+        let applied = if self.pending_scroll > 0 {
+            self.pending_scroll.min(step)
+        } else {
+            self.pending_scroll.max(-step)
+        };
+        self.pending_scroll -= applied;
+        let count = self.process_count();
+        let next = (self.selected_process as i64 + applied as i64).clamp(0, (count - 1) as i64);
+        let next = next as usize;
+        if next != self.selected_process {
+            self.selected_process = next;
             self.dirty = true;
         }
     }
@@ -676,8 +651,7 @@ impl App {
     }
 }
 
-fn main() -> Result<()> {
-    color_eyre::install()?;
+fn main() -> AppResult<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -698,11 +672,14 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()>
+fn run_app<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+) -> AppResult<()>
 where
     B::Error: std::error::Error + Send + Sync + 'static,
 {
-    let frame_budget = Duration::from_millis(MAX_FRAME_MS);
+    let frame_budget = Duration::from_nanos(FRAME_BUDGET_NS);
     let mut last_draw = Instant::now() - frame_budget;
     loop {
         let tick_timeout = app
@@ -719,6 +696,7 @@ where
         };
 
         if event::poll(timeout)? {
+            let mut handled = 0usize;
             loop {
                 if let Event::Key(key) = event::read()? {
                     app.last_input = Instant::now();
@@ -736,12 +714,18 @@ where
                                     {
                                         return Ok(());
                                     }
-                                    KeyCode::Down => app.next_process(),
-                                    KeyCode::Up => app.previous_process(),
-                                    KeyCode::PageDown => app.page_down(page_size),
-                                    KeyCode::PageUp => app.page_up(page_size),
-                                    KeyCode::Home => app.jump_top(),
-                                    KeyCode::End => app.jump_bottom(),
+                                    KeyCode::Down => app.queue_scroll(1),
+                                    KeyCode::Up => app.queue_scroll(-1),
+                                    KeyCode::PageDown => app.queue_scroll(page_size as i32),
+                                    KeyCode::PageUp => app.queue_scroll(-(page_size as i32)),
+                                    KeyCode::Home => {
+                                        app.pending_scroll = 0;
+                                        app.jump_top();
+                                    }
+                                    KeyCode::End => {
+                                        app.pending_scroll = 0;
+                                        app.jump_bottom();
+                                    }
                                     KeyCode::Char('/') => app.start_filter_input(),
                                     KeyCode::Char('x') => app.clear_filter(),
                                     KeyCode::Char('t') => {
@@ -776,11 +760,18 @@ where
                         }
                     }
                 }
+                handled += 1;
+                if handled >= MAX_INPUT_EVENTS_PER_CYCLE {
+                    break;
+                }
                 if !event::poll(Duration::from_millis(0))? {
                     break;
                 }
             }
         }
+
+        let max_scroll_step = (app.last_table_visible_rows / 3).max(1);
+        app.flush_pending_scroll(max_scroll_step);
 
         if app.last_tick.elapsed() >= app.tick_rate {
             let update_started = Instant::now();
@@ -1180,12 +1171,37 @@ fn ui(f: &mut Frame, app: &mut App) {
         app.process_count()
     );
     let width = root[2].width as usize;
-    let spacer = width.saturating_sub(footer_left.chars().count() + footer_right.len());
-    f.render_widget(
-        Paragraph::new(format!("{footer_left}{}{footer_right}", " ".repeat(spacer)))
-            .style(Style::default().fg(Color::DarkGray)),
-        root[2],
-    );
+    let right_len = footer_right.chars().count();
+    if width <= right_len + 1 {
+        f.render_widget(
+            Paragraph::new(trim_text(&footer_right, width))
+                .style(Style::default().fg(Color::DarkGray)),
+            root[2],
+        );
+    } else {
+        let left_width = width - right_len - 1;
+        let left_rect = Rect {
+            x: root[2].x,
+            y: root[2].y,
+            width: left_width as u16,
+            height: 1,
+        };
+        let right_rect = Rect {
+            x: root[2].x + left_width as u16 + 1,
+            y: root[2].y,
+            width: right_len as u16,
+            height: 1,
+        };
+        f.render_widget(
+            Paragraph::new(trim_text(footer_left, left_width))
+                .style(Style::default().fg(Color::DarkGray)),
+            left_rect,
+        );
+        f.render_widget(
+            Paragraph::new(footer_right).style(Style::default().fg(Color::DarkGray)),
+            right_rect,
+        );
+    }
 
     if !app.status_msg.is_empty() {
         let status_area = Rect {
