@@ -666,8 +666,46 @@ fn main() {
         if poll_ret > 0 && (fds[0].revents & POLLIN) != 0 {
             while let Some(key) = read_key() {
                 input = true;
-                if is_search { match key { Key::Quit => running = false, Key::Enter | Key::Esc => { if let Key::Esc = key { filter.clear(); } is_search = false; }, Key::Backspace => { filter.pop(); }, Key::Char(c) => { filter.push(c); }, _ => {} } }
-                else { match key { Key::Quit => running = false, Key::Up => sel = sel.saturating_sub(1), Key::Down => sel += 1, Key::Left => sort = SortMode::Cpu, Key::Right => sort = SortMode::Memory, Key::Char(c) => match c { 'q' => running = false, 'j' => sel += 1, 'k' => sel = sel.saturating_sub(1), 'h' => sort = SortMode::Cpu, 'l' => sort = SortMode::Memory, '/' => is_search = true, _ => {} }, _ => {} } }
+                if is_search {
+                    match key {
+                        Key::Quit => running = false,
+                        Key::Enter | Key::Esc => {
+                            if let Key::Esc = key {
+                                filter.clear();
+                            }
+                            is_search = false;
+                        }
+                        Key::Backspace => {
+                            if filter.is_empty() {
+                                is_search = false;
+                            } else {
+                                filter.pop();
+                            }
+                        }
+                        Key::Char(c) => {
+                            filter.push(c);
+                        }
+                        _ => {}
+                    }
+                } else {
+                    match key {
+                        Key::Quit => running = false,
+                        Key::Up => sel = sel.saturating_sub(1),
+                        Key::Down => sel += 1,
+                        Key::Left => sort = SortMode::Cpu,
+                        Key::Right => sort = SortMode::Memory,
+                        Key::Char(c) => match c {
+                            'q' => running = false,
+                            'j' => sel += 1,
+                            'k' => sel = sel.saturating_sub(1),
+                            'h' => sort = SortMode::Cpu,
+                            'l' => sort = SortMode::Memory,
+                            '/' => is_search = true,
+                            _ => {}
+                        },
+                        _ => {}
+                    }
+                }
             }
         }
         if filter != old_f { sel = 0; }
