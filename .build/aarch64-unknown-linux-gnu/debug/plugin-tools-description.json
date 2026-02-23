@@ -1,0 +1,211 @@
+{
+  "builtTestProducts" : [
+
+  ],
+  "copyCommands" : {
+
+  },
+  "explicitTargetDependencyImportCheckingMode" : {
+    "none" : {
+
+    }
+  },
+  "generatedSourceTargetSet" : [
+
+  ],
+  "pluginDescriptions" : [
+
+  ],
+  "swiftCommands" : {
+    "C.stop-aarch64-unknown-linux-gnu-debug.module" : {
+      "executable" : "/home/euxaristia/.local/share/swiftly/toolchains/6.2.3/usr/bin/swiftc",
+      "fileList" : "/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/stop.build/sources",
+      "importPath" : "/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/Modules",
+      "inputs" : [
+        {
+          "kind" : "file",
+          "name" : "/home/euxaristia/Projects/stop/Sources/stop/main.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/swift-version-4D751F277A41598F.txt"
+        },
+        {
+          "kind" : "file",
+          "name" : "/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/stop.build/sources"
+        }
+      ],
+      "isLibrary" : false,
+      "moduleName" : "stop",
+      "moduleOutputPath" : "/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/Modules/stop.swiftmodule",
+      "objects" : [
+        "/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/stop.build/main.swift.o"
+      ],
+      "otherArguments" : [
+        "-target",
+        "aarch64-unknown-linux-gnu",
+        "-incremental",
+        "-enable-batch-mode",
+        "-serialize-diagnostics",
+        "-index-store-path",
+        "/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/index/store",
+        "-Onone",
+        "-enable-testing",
+        "-j4",
+        "-DSWIFT_PACKAGE",
+        "-DDEBUG",
+        "-DSWIFT_MODULE_RESOURCE_BUNDLE_UNAVAILABLE",
+        "-module-cache-path",
+        "/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/ModuleCache",
+        "-parseable-output",
+        "-Xfrontend",
+        "-entry-point-function-name",
+        "-Xfrontend",
+        "stop_main",
+        "-color-diagnostics",
+        "-swift-version",
+        "5",
+        "-g",
+        "-Xcc",
+        "-fPIC",
+        "-Xcc",
+        "-g",
+        "-package-name",
+        "stop",
+        "-Xcc",
+        "-fno-omit-frame-pointer"
+      ],
+      "outputFileMapPath" : "/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/stop.build/output-file-map.json",
+      "outputs" : [
+        {
+          "kind" : "file",
+          "name" : "/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/stop.build/main.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/Modules/stop.swiftmodule"
+        }
+      ],
+      "prepareForIndexing" : false,
+      "sources" : [
+        "/home/euxaristia/Projects/stop/Sources/stop/main.swift"
+      ],
+      "tempsPath" : "/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/stop.build",
+      "wholeModuleOptimization" : false
+    }
+  },
+  "swiftFrontendCommands" : {
+
+  },
+  "swiftTargetScanArgs" : {
+    "stop" : [
+      "/home/euxaristia/.local/share/swiftly/toolchains/6.2.3/usr/bin/swiftc",
+      "-module-name",
+      "stop",
+      "-package-name",
+      "stop",
+      "-c",
+      "/home/euxaristia/Projects/stop/Sources/stop/main.swift",
+      "-I",
+      "/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/Modules",
+      "-target",
+      "aarch64-unknown-linux-gnu",
+      "-incremental",
+      "-enable-batch-mode",
+      "-serialize-diagnostics",
+      "-index-store-path",
+      "/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/index/store",
+      "-Onone",
+      "-enable-testing",
+      "-j4",
+      "-DSWIFT_PACKAGE",
+      "-DDEBUG",
+      "-DSWIFT_MODULE_RESOURCE_BUNDLE_UNAVAILABLE",
+      "-module-cache-path",
+      "/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/ModuleCache",
+      "-parseable-output",
+      "-Xfrontend",
+      "-entry-point-function-name",
+      "-Xfrontend",
+      "stop_main",
+      "-color-diagnostics",
+      "-swift-version",
+      "5",
+      "-g",
+      "-Xcc",
+      "-fPIC",
+      "-Xcc",
+      "-g",
+      "-package-name",
+      "stop",
+      "-Xcc",
+      "-fno-omit-frame-pointer",
+      "-driver-use-frontend-path",
+      "/home/euxaristia/.local/share/swiftly/toolchains/6.2.3/usr/bin/swiftc"
+    ]
+  },
+  "targetDependencyMap" : {
+    "stop" : [
+
+    ]
+  },
+  "testDiscoveryCommands" : {
+
+  },
+  "testEntryPointCommands" : {
+
+  },
+  "traitConfiguration" : {
+    "default" : {
+
+    }
+  },
+  "writeCommands" : {
+    "/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/stop.build/sources" : {
+      "alwaysOutOfDate" : false,
+      "inputs" : [
+        {
+          "kind" : "virtual",
+          "name" : "<sources-file-list>"
+        },
+        {
+          "kind" : "file",
+          "name" : "/home/euxaristia/Projects/stop/Sources/stop/main.swift"
+        }
+      ],
+      "outputFilePath" : "/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/stop.build/sources"
+    },
+    "/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/stop.product/Objects.LinkFileList" : {
+      "alwaysOutOfDate" : false,
+      "inputs" : [
+        {
+          "kind" : "virtual",
+          "name" : "<link-file-list>"
+        },
+        {
+          "kind" : "file",
+          "name" : "/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/stop.build/main.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/stop.build/stop.swiftmodule.o"
+        }
+      ],
+      "outputFilePath" : "/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/stop.product/Objects.LinkFileList"
+    },
+    "/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/swift-version-4D751F277A41598F.txt" : {
+      "alwaysOutOfDate" : true,
+      "inputs" : [
+        {
+          "kind" : "virtual",
+          "name" : "<swift-get-version>"
+        },
+        {
+          "kind" : "file",
+          "name" : "/home/euxaristia/.local/share/swiftly/toolchains/6.2.3/usr/bin/swiftc"
+        }
+      ],
+      "outputFilePath" : "/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/swift-version-4D751F277A41598F.txt"
+    }
+  }
+}

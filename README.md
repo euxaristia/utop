@@ -1,46 +1,44 @@
-# stop (Swift)
+# stop (Rust)
 
-`stop` is now a pure Swift terminal system monitor for Linux.
+`stop` is a pure Rust terminal system monitor for Linux.
 
-- No third-party libraries.
-- Data source is Linux `/proc`.
+- No third-party TUI libraries (uses `libc` for terminal control).
+- Data source is Linux `/proc` and `/sys`.
 - Rendering is ANSI terminal output.
 
 ## Features
 
-- Real-time CPU usage
-- Memory usage (`MemTotal` / `MemAvailable`)
-- Network throughput (auto-selects busiest non-loopback interface)
-- Process table sorted by CPU%
-- Keyboard navigation for process selection
+- Real-time CPU usage & Temperature
+- Memory & Swap usage
+- GPU usage (NVIDIA, AMD, Intel, VideoCore, Adreno)
+- Network throughput
+- Process table with sorting (CPU/Memory)
+- Search/Filter support
 
 ## Requirements
 
 - Linux
-- Swift toolchain (SwiftPM)
+- Rust (Cargo)
 
 ## Build
 
 ```bash
-swift build -c release
+cargo build --release
 ```
 
 ## Run
 
 ```bash
-swift run -c release stop
+./target/release/stop
 ```
 
 ## Controls
 
 - `q`: quit
-- `j` / `↓`: move selection down
-- `k` / `↑`: move selection up
-
-## Notes
-
-- This implementation intentionally uses only Swift stdlib/Foundation and Linux system APIs.
-- No external package dependencies are used.
+- `j`/`k` or `↑`/`↓`: move selection
+- `h`/`l` or `←`/`→`: sort by CPU or Memory
+- `/`: search/filter processes
+- `Esc`: clear search/filter
 
 ## License
 

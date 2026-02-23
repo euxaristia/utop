@@ -1,0 +1,1 @@
+stop requires an interactive terminal (TTY). Run it directly in a terminal session.

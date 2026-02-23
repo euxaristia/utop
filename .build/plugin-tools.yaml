@@ -1,0 +1,73 @@
+client:
+  name: basic
+  file-system: device-agnostic
+tools: {}
+targets:
+  "PackageStructure": ["<PackageStructure>"]
+  "main": ["<stop-aarch64-unknown-linux-gnu-debug.exe>","<stop-aarch64-unknown-linux-gnu-debug.module>"]
+  "stop-aarch64-unknown-linux-gnu-debug.exe": ["<stop-aarch64-unknown-linux-gnu-debug.exe>"]
+  "stop-aarch64-unknown-linux-gnu-debug.module": ["<stop-aarch64-unknown-linux-gnu-debug.module>"]
+  "test": ["<stop-aarch64-unknown-linux-gnu-debug.exe>","<stop-aarch64-unknown-linux-gnu-debug.module>"]
+default: "main"
+nodes:
+  "/home/euxaristia/Projects/stop/Sources/stop/":
+    is-directory-structure: true
+    content-exclusion-patterns: [".git",".build"]
+commands:
+  "/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/stop.build/sources":
+    tool: write-auxiliary-file
+    inputs: ["<sources-file-list>","/home/euxaristia/Projects/stop/Sources/stop/main.swift"]
+    outputs: ["/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/stop.build/sources"]
+    description: "Write auxiliary file /home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/stop.build/sources"
+
+  "/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/stop.build/stop.swiftmodule.o":
+    tool: shell
+    inputs: ["/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/Modules/stop.swiftmodule"]
+    outputs: ["/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/stop.build/stop.swiftmodule.o"]
+    description: "Wrapping AST for stop for debugging"
+    args: ["/home/euxaristia/.local/share/swiftly/toolchains/6.2.3/usr/bin/swiftc","-modulewrap","/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/Modules/stop.swiftmodule","-o","/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/stop.build/stop.swiftmodule.o","-target","aarch64-unknown-linux-gnu"]
+
+  "/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/stop.product/Objects.LinkFileList":
+    tool: write-auxiliary-file
+    inputs: ["<link-file-list>","/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/stop.build/main.swift.o","/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/stop.build/stop.swiftmodule.o"]
+    outputs: ["/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/stop.product/Objects.LinkFileList"]
+    description: "Write auxiliary file /home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/stop.product/Objects.LinkFileList"
+
+  "/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/swift-version-4D751F277A41598F.txt":
+    tool: write-auxiliary-file
+    inputs: ["<swift-get-version>","/home/euxaristia/.local/share/swiftly/toolchains/6.2.3/usr/bin/swiftc"]
+    outputs: ["/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/swift-version-4D751F277A41598F.txt"]
+    always-out-of-date: "true"
+    description: "Write auxiliary file /home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/swift-version-4D751F277A41598F.txt"
+
+  "<stop-aarch64-unknown-linux-gnu-debug.exe>":
+    tool: phony
+    inputs: ["/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/stop"]
+    outputs: ["<stop-aarch64-unknown-linux-gnu-debug.exe>"]
+
+  "<stop-aarch64-unknown-linux-gnu-debug.module>":
+    tool: phony
+    inputs: ["/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/stop.build/main.swift.o","/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/Modules/stop.swiftmodule"]
+    outputs: ["<stop-aarch64-unknown-linux-gnu-debug.module>"]
+
+  "C.stop-aarch64-unknown-linux-gnu-debug.exe":
+    tool: shell
+    inputs: ["/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/stop.build/main.swift.o","/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/stop.build/stop.swiftmodule.o","/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/stop.product/Objects.LinkFileList"]
+    outputs: ["/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/stop"]
+    description: "Linking ./.build/aarch64-unknown-linux-gnu/debug/stop"
+    args: ["/home/euxaristia/.local/share/swiftly/toolchains/6.2.3/usr/bin/swiftc","-L","/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug","-o","/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/stop","-module-name","stop","-emit-executable","-Xlinker","--defsym","-Xlinker","main=stop_main","-Xlinker","-rpath=$ORIGIN","@/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/stop.product/Objects.LinkFileList","-target","aarch64-unknown-linux-gnu","-g"]
+
+  "C.stop-aarch64-unknown-linux-gnu-debug.module":
+    tool: shell
+    inputs: ["/home/euxaristia/Projects/stop/Sources/stop/main.swift","/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/swift-version-4D751F277A41598F.txt","/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/stop.build/sources"]
+    outputs: ["/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/stop.build/main.swift.o","/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/Modules/stop.swiftmodule"]
+    description: "Compiling Swift Module 'stop' (1 sources)"
+    args: ["/home/euxaristia/.local/share/swiftly/toolchains/6.2.3/usr/bin/swiftc","-module-name","stop","-emit-dependencies","-emit-module","-emit-module-path","/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/Modules/stop.swiftmodule","-output-file-map","/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/stop.build/output-file-map.json","-incremental","-c","@/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/stop.build/sources","-I","/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/Modules","-target","aarch64-unknown-linux-gnu","-incremental","-enable-batch-mode","-serialize-diagnostics","-index-store-path","/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/index/store","-Onone","-enable-testing","-j4","-DSWIFT_PACKAGE","-DDEBUG","-DSWIFT_MODULE_RESOURCE_BUNDLE_UNAVAILABLE","-module-cache-path","/home/euxaristia/Projects/stop/.build/aarch64-unknown-linux-gnu/debug/ModuleCache","-parseable-output","-Xfrontend","-entry-point-function-name","-Xfrontend","stop_main","-color-diagnostics","-swift-version","5","-g","-Xcc","-fPIC","-Xcc","-g","-package-name","stop","-Xcc","-fno-omit-frame-pointer"]
+
+  "PackageStructure":
+    tool: package-structure-tool
+    inputs: ["/home/euxaristia/Projects/stop/Sources/stop/","/home/euxaristia/Projects/stop/Package.swift","/home/euxaristia/Projects/stop/Package.resolved"]
+    outputs: ["<PackageStructure>"]
+    description: "Planning build"
+    allow-missing-inputs: true
+
