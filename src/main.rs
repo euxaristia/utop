@@ -275,7 +275,7 @@ impl Sampler {
                     let type_path = entry.path().join("type");
                     if let Ok(t_type) = fs::read_to_string(type_path) {
                         let t_type = t_type.trim().to_lowercase();
-                        if t_type.contains("pkg") || t_type.contains("cpu") || t_type.contains("core") {
+                        if t_type.contains("pkg") || t_type.contains("cpu") || t_type.contains("core") || t_type.contains("soc") {
                             if let Ok(temp_str) = fs::read_to_string(entry.path().join("temp")) {
                                 if let Ok(t) = temp_str.trim().parse::<f64>() { return Some(t / 1000.0); }
                             }
@@ -320,7 +320,53 @@ impl Sampler {
                 return Some(freqs.iter().sum::<f64>() / freqs.len() as f64);
             }
         }
-        None
+        
+        // Fallback: Check sysfs (common on arm64 and newer kernels)
+        // Check /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq
+        let mut total_freq = 0.0;
+        let mut count = 0;
+        if let Ok(entries) = fs::read_dir("/sys/devices/system/cpu") {
+            for entry in entries.flatten() {
+                let name = entry.file_name().into_string().unwrap_or_default();
+                if name.starts_with("cpu") && name[3..].chars().all(|c| c.is_ascii_digit()) {
+                    let path = entry.path().join("cpufreq/scaling_cur_freq");
+                    if let Ok(content) = fs::read_to_string(path) {
+                        if let Ok(freq_khz) = content.trim().parse::<f64>() {
+                            total_freq += freq_khz / 1000.0;
+                            count += 1;
+                        }
+                    }
+                }
+            }
+        }
+        
+        if count > 0 {
+            return Some(total_freq / count as f64);
+        }
+        
+        // Final fallback: try cpufreq policies
+        if let Ok(entries) = fs::read_dir("/sys/devices/system/cpu/cpufreq") {
+            for entry in entries.flatten() {
+                if entry.file_name().into_string().unwrap_or_default().starts_with("policy") {
+                    if let Ok(content) = fs::read_to_string(entry.path().join("scaling_cur_freq")) {
+                        if let Ok(freq_khz) = content.trim().parse::<f64>() {
+                            // Policies might apply to multiple CPUs, but for a simple average it's usually fine
+                            // or we can count affected_cpus
+                            let affected = fs::read_to_string(entry.path().join("affected_cpus")).unwrap_or_default();
+                            let num_affected = affected.split_whitespace().count().max(1);
+                            total_freq += (freq_khz / 1000.0) * num_affected as f64;
+                            count += num_affected;
+                        }
+                    }
+                }
+            }
+        }
+
+        if count > 0 {
+            Some(total_freq / count as f64)
+        } else {
+            None
+        }
     }
 
     fn read_memory(&self) -> MemorySnapshot {
