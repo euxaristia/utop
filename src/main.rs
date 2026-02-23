@@ -108,7 +108,7 @@ fn write_esc(sequence: &str) {
     }
 }
 
-extern "C" fn rtop_restore_terminal() {
+extern "C" fn utop_restore_terminal() {
     unsafe {
         if G_TERMIOS_ACTIVE == 0 { return; }
         let restore = G_TERMIOS_ORIGINAL;
@@ -125,8 +125,8 @@ extern "C" fn rtop_restore_terminal() {
     }
 }
 
-extern "C" fn rtop_signal_handler(sig: c_int) {
-    rtop_restore_terminal();
+extern "C" fn utop_signal_handler(sig: c_int) {
+    utop_restore_terminal();
     unsafe {
         signal(sig, SIG_DFL);
         libc::kill(libc::getpid(), sig);
@@ -168,7 +168,7 @@ impl TerminalRawMode {
     fn restore_now(&mut self) {
         if !self.active { return; }
         self.active = false;
-        rtop_restore_terminal();
+        utop_restore_terminal();
     }
 }
 
@@ -212,7 +212,7 @@ impl Sampler {
         }
     }
 
-    fn sample(&mut self, sort_mode: SortMode, filter: &str) -> (f64, Option<f64>, MemorySnapshot, NetworkSnapshot, Option<GpuSnapshot>, Vec<ProcessInfo>, usize) {
+    fn sample(&mut self, sort_mode: SortMode, filter: &str) -> (f64, Option<f64>, Option<f64>, MemorySnapshot, NetworkSnapshot, Option<GpuSnapshot>, Vec<ProcessInfo>, usize) {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_sample_at).as_secs_f64().max(0.001);
         self.last_sample_at = now;
@@ -220,12 +220,13 @@ impl Sampler {
         let current_cpu = self.read_cpu_times();
         let (cpu_percent, delta) = self.compute_cpu_delta(current_cpu);
         let cpu_temp = self.read_cpu_temp();
+        let cpu_freq = self.read_cpu_freq();
         let memory = self.read_memory();
         let network = self.read_network(elapsed);
         let gpu = self.read_gpu();
         let processes = self.read_processes(delta, sort_mode, filter);
 
-        (cpu_percent, cpu_temp, memory, network, gpu, processes, self.cpu_count)
+        (cpu_percent, cpu_temp, cpu_freq, memory, network, gpu, processes, self.cpu_count)
     }
 
     fn read_cpu_times(&mut self) -> Option<CpuTimes> {
@@ -307,6 +308,20 @@ impl Sampler {
                         if let Some(bt) = best_temp { return Some(bt); }
                     }
                 }
+            }
+        }
+        None
+    }
+
+    fn read_cpu_freq(&self) -> Option<f64> {
+        if let Ok(content) = fs::read_to_string("/proc/cpuinfo") {
+            let freqs: Vec<f64> = content.lines()
+                .filter(|l| l.starts_with("cpu MHz"))
+                .filter_map(|l| l.split(':').nth(1))
+                .filter_map(|s| s.trim().parse::<f64>().ok())
+                .collect();
+            if !freqs.is_empty() {
+                return Some(freqs.iter().sum::<f64>() / freqs.len() as f64);
             }
         }
         None
@@ -583,7 +598,7 @@ fn append_line(out: &mut String, line: &str, cols: usize, selected: bool) {
     else { out.push_str("\x1B[0m\x1B[2K"); out.push_str(&clip_line(line, cols)); out.push('\n'); }
 }
 
-fn render(cpu: f64, cpu_temp: Option<f64>, mem: &MemorySnapshot, net: &NetworkSnapshot, gpu: &Option<GpuSnapshot>, procs: &[ProcessInfo], selected: usize, cpu_count: usize, sort: SortMode, filter: &str, is_searching: bool) {
+fn render(cpu: f64, cpu_temp: Option<f64>, cpu_freq: Option<f64>, mem: &MemorySnapshot, net: &NetworkSnapshot, gpu: &Option<GpuSnapshot>, procs: &[ProcessInfo], selected: usize, cpu_count: usize, sort: SortMode, filter: &str, is_searching: bool) {
     let (rows, cols) = term_size();
     let header_height = 12;
     let visible_rows = (rows as i32 - header_height as i32 - 3).max(5) as usize;
@@ -591,8 +606,9 @@ fn render(cpu: f64, cpu_temp: Option<f64>, mem: &MemorySnapshot, net: &NetworkSn
     let scroll_top = (safe_sel as i32 - (visible_rows as i32 / 2)).max(0).min((procs.len() as i32 - visible_rows as i32).max(0)) as usize;
     let mut out = String::new();
     out.push_str("\x1B[H"); // Cursor Home
-    append_line(&mut out, &format!("stop (pure Rust)    CPUs: {}", cpu_count), cols, false);
-    append_line(&mut out, &format!("CPU: {:5.1}%{}", cpu, cpu_temp.map(|t| format!(" {:4.1}°C", t)).unwrap_or_default()), cols, false);
+    append_line(&mut out, &format!("utop    CPUs: {}", cpu_count), cols, false);
+    let freq_str = cpu_freq.map(|f| format!(" @ {:.2} GHz", f / 1000.0)).unwrap_or_default();
+    append_line(&mut out, &format!("CPU: {:5.1}%{}{}", cpu, freq_str, cpu_temp.map(|t| format!(" {:4.1}°C", t)).unwrap_or_default()), cols, false);
     append_line(&mut out, &format!("MEM: {:5.1}%  {} / {}", mem.combined_percent(), human_bytes(mem.combined_used()), human_bytes(mem.combined_total())), cols, false);
     append_line(&mut out, &format!("SWP: {:5.1}%  {} / {}", mem.swap_percent(), human_bytes(mem.swap_used_bytes), human_bytes(mem.swap_total_bytes)), cols, false);
     if let Some(g) = gpu {
@@ -636,12 +652,12 @@ fn read_key() -> Option<Key> {
 }
 
 fn main() {
-    if unsafe { libc::isatty(STDIN_FILENO) } != 1 || unsafe { libc::isatty(STDOUT_FILENO) } != 1 { eprintln!("stop requires an interactive terminal."); std::process::exit(1); }
+    if unsafe { libc::isatty(STDIN_FILENO) } != 1 || unsafe { libc::isatty(STDOUT_FILENO) } != 1 { eprintln!("utop requires an interactive terminal."); std::process::exit(1); }
     unsafe {
-        signal(SIGINT, rtop_signal_handler as *const () as usize);
-        signal(SIGTERM, rtop_signal_handler as *const () as usize);
-        signal(SIGHUP, rtop_signal_handler as *const () as usize);
-        signal(SIGQUIT, rtop_signal_handler as *const () as usize);
+        signal(SIGINT, utop_signal_handler as *const () as usize);
+        signal(SIGTERM, utop_signal_handler as *const () as usize);
+        signal(SIGHUP, utop_signal_handler as *const () as usize);
+        signal(SIGQUIT, utop_signal_handler as *const () as usize);
     }
     let mut terminal = TerminalRawMode::new().expect("failed to init terminal");
     let mut sampler = Sampler::new();
@@ -709,10 +725,10 @@ fn main() {
             }
         }
         if filter != old_f { sel = 0; }
-        if input { if is_search || !filter.is_empty() || sort != SortMode::Cpu { latest = sampler.sample(sort, &filter); } sel = sel.min(latest.5.len().saturating_sub(1)); needs_r = true; }
+        if input { if is_search || !filter.is_empty() || sort != SortMode::Cpu { latest = sampler.sample(sort, &filter); } sel = sel.min(latest.6.len().saturating_sub(1)); needs_r = true; }
         let now_p = Instant::now();
-        if now_p >= next_s { latest = sampler.sample(sort, &filter); sel = sel.min(latest.5.len().saturating_sub(1)); needs_r = true; next_s = now_p + Duration::from_millis(500); }
-        if needs_r && now_p >= next_r { render(latest.0, latest.1, &latest.2, &latest.3, &latest.4, &latest.5, sel, latest.6, sort, &filter, is_search); needs_r = false; next_r = now_p + Duration::from_micros(1_000_000 / 30); }
+        if now_p >= next_s { latest = sampler.sample(sort, &filter); sel = sel.min(latest.6.len().saturating_sub(1)); needs_r = true; next_s = now_p + Duration::from_millis(500); }
+        if needs_r && now_p >= next_r { render(latest.0, latest.1, latest.2, &latest.3, &latest.4, &latest.5, &latest.6, sel, latest.7, sort, &filter, is_search); needs_r = false; next_r = now_p + Duration::from_micros(1_000_000 / 30); }
     }
     terminal.restore_now();
 }

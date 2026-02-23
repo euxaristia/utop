@@ -1,6 +1,6 @@
-# stop (Rust)
+# utop
 
-`stop` is a pure Rust terminal system monitor for Linux.
+`utop` is a pure Rust terminal system monitor for Linux.
 
 - No third-party TUI libraries (uses `libc` for terminal control).
 - Data source is Linux `/proc` and `/sys`.
@@ -8,7 +8,7 @@
 
 ## Features
 
-- Real-time CPU usage & Temperature
+- Real-time CPU usage, Frequency & Temperature
 - Memory & Swap usage
 - GPU usage (NVIDIA, AMD, Intel, VideoCore, Adreno)
 - Network throughput
@@ -29,7 +29,7 @@ cargo build --release
 ## Run
 
 ```bash
-./target/release/stop
+./target/release/utop
 ```
 
 ## Controls
