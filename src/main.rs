@@ -694,7 +694,7 @@ fn render(cpu: f64, cpu_temp: Option<f64>, cpu_freq: Option<f64>, mem: &MemorySn
     
     let show_cma = mem.cma_total_bytes > 0 && match gpu {
         Some(g) => g.mem_total != Some(mem.cma_total_bytes),
-        None => true,
+        None => false,
     };
     if show_cma {
         append_line(&mut out, &format!("CMA: {:5.1}%  {} / {}", mem.cma_percent(), human_bytes(mem.cma_used_bytes), human_bytes(mem.cma_total_bytes)), cols, false);
