@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use libc::{
@@ -184,8 +185,11 @@ struct Sampler {
     last_sample_at: Instant,
     page_size: u64,
     cpu_count: usize,
-    last_nvidia_sample_at: Instant,
-    last_nvidia_gpu: Option<GpuSnapshot>,
+    last_gpu_sample_at: Instant,
+    last_gpu: Option<GpuSnapshot>,
+    gpu_path_cache: Option<PathBuf>,
+    has_nvidia: Option<bool>,
+    cma_info: (Option<u64>, Option<u64>), // (used, total)
     last_v3d_stats: HashMap<String, (u64, u64)>,
 }
 
@@ -202,8 +206,11 @@ impl Sampler {
             last_sample_at: Instant::now(),
             page_size,
             cpu_count,
-            last_nvidia_sample_at: Instant::now() - Duration::from_secs(10),
-            last_nvidia_gpu: None,
+            last_gpu_sample_at: Instant::now() - Duration::from_secs(10),
+            last_gpu: None,
+            gpu_path_cache: None,
+            has_nvidia: None,
+            cma_info: (None, None),
             last_v3d_stats: HashMap::new(),
         }
     }
@@ -369,15 +376,23 @@ impl Sampler {
         }
     }
 
-    fn read_memory(&self) -> MemorySnapshot {
+    fn read_memory(&mut self) -> MemorySnapshot {
         let content = fs::read_to_string("/proc/meminfo").unwrap_or_default();
         let mut snapshot = MemorySnapshot::default();
         let (mut total_kb, mut avail_kb, mut swap_total_kb, mut swap_free_kb) = (0, 0, 0, 0);
+        let (mut cma_t, mut cma_f) = (0, 0);
         for line in content.lines() {
             if line.starts_with("MemTotal:") { total_kb = parse_meminfo_kb(line); }
             else if line.starts_with("MemAvailable:") { avail_kb = parse_meminfo_kb(line); }
             else if line.starts_with("SwapTotal:") { swap_total_kb = parse_meminfo_kb(line); }
             else if line.starts_with("SwapFree:") { swap_free_kb = parse_meminfo_kb(line); }
+            else if line.starts_with("CmaTotal:") { cma_t = parse_meminfo_kb(line); }
+            else if line.starts_with("CmaFree:") { cma_f = parse_meminfo_kb(line); }
+        }
+        if cma_t > 0 {
+            self.cma_info = (Some(if cma_t > cma_f { (cma_t - cma_f) * 1024 } else { 0 }), Some(cma_t * 1024));
+        } else {
+            self.cma_info = (None, None);
         }
         snapshot.total_bytes = total_kb * 1024;
         snapshot.used_bytes = if total_kb > avail_kb { (total_kb - avail_kb) * 1024 } else { 0 };
@@ -415,12 +430,18 @@ impl Sampler {
 
     fn read_gpu(&mut self) -> Option<GpuSnapshot> {
         let now = Instant::now();
-        if now.duration_since(self.last_nvidia_sample_at) >= Duration::from_millis(800) {
-            self.last_nvidia_sample_at = now;
+        if now.duration_since(self.last_gpu_sample_at) < Duration::from_millis(800) {
+            return self.last_gpu.clone();
+        }
+        self.last_gpu_sample_at = now;
+
+        // 1. NVIDIA via nvidia-smi
+        if self.has_nvidia.unwrap_or(true) {
             if let Ok(output) = std::process::Command::new("/usr/bin/nvidia-smi")
                 .args(["--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu", "--format=csv,noheader,nounits"])
                 .output() {
                 if output.status.success() {
+                    self.has_nvidia = Some(true);
                     let out_str = String::from_utf8_lossy(&output.stdout);
                     let parts: Vec<&str> = out_str.trim().split(',').map(|s| s.trim()).collect();
                     if parts.len() >= 4 {
@@ -428,133 +449,140 @@ impl Sampler {
                         let mem_used = parts[1].parse::<u64>().ok().map(|v| v * 1024 * 1024);
                         let mem_total = parts[2].parse::<u64>().ok().map(|v| v * 1024 * 1024);
                         let temp = parts[3].parse().ok();
-                        self.last_nvidia_gpu = Some(GpuSnapshot { name: "NVIDIA GPU".to_string(), usage, mem_used, mem_total, temp });
-                        return self.last_nvidia_gpu.clone();
+                        self.last_gpu = Some(GpuSnapshot { name: "NVIDIA GPU".to_string(), usage, mem_used, mem_total, temp });
+                        return self.last_gpu.clone();
+                    }
+                } else {
+                    self.has_nvidia = Some(false);
+                }
+            } else {
+                self.has_nvidia = Some(false);
+            }
+        }
+
+        // 2. DRM / sysfs
+        let mut drm_entries = Vec::new();
+        if let Some(path) = &self.gpu_path_cache {
+            drm_entries.push(path.clone());
+        }
+        if let Ok(entries) = fs::read_dir("/sys/class/drm") {
+            for e in entries.flatten() {
+                let p = e.path();
+                if !drm_entries.contains(&p) { drm_entries.push(p); }
+            }
+        }
+
+        for card_path in drm_entries {
+            let name = card_path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            if name.starts_with("card") && !name.contains('-') {
+                let device_path = card_path.join("device");
+                let mut usage: Option<f64> = None;
+                let usage_paths = [device_path.join("gpu_busy_percent"), card_path.join("gt/gt0/usage"), device_path.join("usage"), device_path.join("load")];
+                for p in usage_paths {
+                    if let Ok(val) = fs::read_to_string(p) {
+                        if let Some(first) = val.trim().split('@').next() {
+                            if let Ok(u) = first.parse() { usage = Some(u); break; }
+                        }
+                    }
+                }
+                if usage.is_none() {
+                    if let Ok(stats) = fs::read_to_string(device_path.join("gpu_stats")) {
+                        for line in stats.lines().skip(1) {
+                            let parts: Vec<&str> = line.split_whitespace().collect();
+                            if parts.len() >= 4 {
+                                if let (Ok(ts), Ok(rt)) = (parts[1].parse::<u64>(), parts[3].parse::<u64>()) {
+                                    let queue = parts[0].to_string();
+                                    if let Some(&(last_ts, last_rt)) = self.last_v3d_stats.get(&queue) {
+                                        if ts > last_ts { usage = Some(usage.unwrap_or(0.0).max(((rt - last_rt) as f64 / (ts - last_ts) as f64) * 100.0)); }
+                                    }
+                                    self.last_v3d_stats.insert(queue, (ts, rt));
+                                }
+                            }
+                        }
+                    }
+                }
+                if usage.is_some() {
+                    let vendor = fs::read_to_string(device_path.join("vendor")).unwrap_or_default().trim().to_lowercase();
+                    let name_str = match vendor.as_str() {
+                        "0x1002" => "AMD GPU", "0x8086" => "Intel GPU", "0x10de" => "NVIDIA GPU", "0x14e4" => "Broadcom GPU",
+                        _ => {
+                            if let Ok(uevent) = fs::read_to_string(device_path.join("uevent")) {
+                                if uevent.contains("DRIVER=v3d") || uevent.contains("DRIVER=vc4") { "VideoCore GPU" } else { "GPU" }
+                            } else { "GPU" }
+                        }
+                    }.to_string();
+                    let (mut mem_used, mut mem_total, mut gpu_temp) = (None, None, None);
+                    if let Ok(h_entries) = fs::read_dir(device_path.join("hwmon")) {
+                        for h_entry in h_entries.flatten() {
+                            if h_entry.file_name().into_string().unwrap_or_default().starts_with("hwmon") {
+                                if let Ok(t_str) = fs::read_to_string(h_entry.path().join("temp1_input")) {
+                                    if let Ok(t) = t_str.trim().parse::<f64>() { gpu_temp = Some(t / 1000.0); }
+                                }
+                            }
+                        }
+                    }
+                    if gpu_temp.is_none() { if let Ok(t_str) = fs::read_to_string("/sys/class/thermal/thermal_zone0/temp") { if let Ok(t) = t_str.trim().parse::<f64>() { gpu_temp = Some(t / 1000.0); } } }
+                    if let Ok(u_str) = fs::read_to_string(device_path.join("mem_info_vram_used")) { mem_used = u_str.trim().parse().ok(); }
+                    if let Ok(t_str) = fs::read_to_string(device_path.join("mem_info_vram_total")) { mem_total = t_str.trim().parse().ok(); }
+                    if mem_used.is_none() {
+                        if let Ok(u_str) = fs::read_to_string(card_path.join("tile0/vram0/used")) { mem_used = u_str.trim().parse().ok(); }
+                        if let Ok(t_str) = fs::read_to_string(card_path.join("tile0/vram0/size")) { mem_total = t_str.trim().parse().ok(); }
+                    }
+                    if mem_used.is_none() && name_str == "VideoCore GPU" {
+                        mem_used = self.cma_info.0; mem_total = self.cma_info.1;
+                    }
+                    self.gpu_path_cache = Some(card_path);
+                    self.last_gpu = Some(GpuSnapshot { name: name_str, usage, mem_used, mem_total, temp: gpu_temp });
+                    return self.last_gpu.clone();
+                }
+            }
+        }
+
+        // 3. Adreno / kgsl
+        let adreno_paths = ["/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage", "/sys/class/kgsl/kgsl-3d0/gpubusy"];
+        for p in adreno_paths {
+            if let Ok(val_str) = fs::read_to_string(p) {
+                let val_str = val_str.trim();
+                let usage = if p.contains("gpubusy") {
+                    let parts: Vec<f64> = val_str.split_whitespace().filter_map(|s| s.parse().ok()).collect();
+                    if parts.len() >= 2 && parts[1] > 0.0 { Some((parts[0] / parts[1]) * 100.0) } else { None }
+                } else { val_str.parse().ok() };
+                if let Some(u) = usage {
+                    let mut a_temp = None;
+                    if let Ok(t_str) = fs::read_to_string("/sys/class/thermal/thermal_zone0/temp") {
+                        if let Ok(t) = t_str.trim().parse::<f64>() { a_temp = Some(t / 1000.0); }
+                    }
+                    self.last_gpu = Some(GpuSnapshot { name: "Adreno GPU".to_string(), usage: Some(u), mem_used: None, mem_total: None, temp: a_temp });
+                    return self.last_gpu.clone();
+                }
+            }
+        }
+
+        // 4. Generic devfreq
+        if let Ok(entries) = fs::read_dir("/sys/class/devfreq") {
+            for entry in entries.flatten() {
+                let df_name = entry.file_name().into_string().unwrap_or_default();
+                if df_name.contains("v3d") || df_name.contains("gpu") || df_name.contains("mali") {
+                    if let Ok(load_str) = fs::read_to_string(entry.path().join("load")) {
+                        if let Some(usage_part) = load_str.trim().split('@').next() {
+                            if let Ok(u) = usage_part.parse::<f64>() {
+                                let mut g_temp = None;
+                                if let Ok(t_str) = fs::read_to_string("/sys/class/thermal/thermal_zone0/temp") {
+                                    if let Ok(t) = t_str.trim().parse::<f64>() { g_temp = Some(t / 1000.0); }
+                                }
+                                let name = if df_name.contains("v3d") { "VideoCore GPU" } else if df_name.contains("mali") { "Mali GPU" } else { "GPU" };
+                                self.last_gpu = Some(GpuSnapshot { name: name.to_string(), usage: Some(u), mem_used: self.cma_info.0, mem_total: self.cma_info.1, temp: g_temp });
+                                return self.last_gpu.clone();
+                            }
+                        }
                     }
                 }
             }
-        } else if self.last_nvidia_gpu.is_some() { return self.last_nvidia_gpu.clone(); }
+        }
 
-        if let Ok(entries) = fs::read_dir("/sys/class/drm") {
-            for entry in entries.flatten() {
-                let name = entry.file_name().into_string().unwrap_or_default();
-                if name.starts_with("card") && !name.contains('-') {
-                    let card_path = entry.path();
-                    let device_path = card_path.join("device");
-                    let mut usage: Option<f64> = None;
-                    let usage_paths = [device_path.join("gpu_busy_percent"), card_path.join("gt/gt0/usage"), device_path.join("usage"), device_path.join("load")];
-                    for p in usage_paths {
-                        if let Ok(val) = fs::read_to_string(p) {
-                            if let Some(first) = val.trim().split('@').next() {
-                                if let Ok(u) = first.parse() { usage = Some(u); break; }
-                            }
-                        }
-                    }
-                    if usage.is_none() {
-                        if let Ok(stats) = fs::read_to_string(device_path.join("gpu_stats")) {
-                            for line in stats.lines().skip(1) {
-                                let parts: Vec<&str> = line.split_whitespace().collect();
-                                if parts.len() >= 4 {
-                                    if let (Ok(ts), Ok(rt)) = (parts[1].parse::<u64>(), parts[3].parse::<u64>()) {
-                                        let queue = parts[0].to_string();
-                                        if let Some(&(last_ts, last_rt)) = self.last_v3d_stats.get(&queue) {
-                                            if ts > last_ts { usage = Some(usage.unwrap_or(0.0).max(((rt - last_rt) as f64 / (ts - last_ts) as f64) * 100.0)); }
-                                        }
-                                        self.last_v3d_stats.insert(queue, (ts, rt));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if usage.is_some() {
-                        let vendor = fs::read_to_string(device_path.join("vendor")).unwrap_or_default().trim().to_lowercase();
-                        let name_str = match vendor.as_str() {
-                            "0x1002" => "AMD GPU", "0x8086" => "Intel GPU", "0x10de" => "NVIDIA GPU", "0x14e4" => "Broadcom GPU",
-                            _ => {
-                                if let Ok(uevent) = fs::read_to_string(device_path.join("uevent")) {
-                                    if uevent.contains("DRIVER=v3d") || uevent.contains("DRIVER=vc4") { "VideoCore GPU" } else { "GPU" }
-                                } else { "GPU" }
-                            }
-                        }.to_string();
-                        let (mut mem_used, mut mem_total, mut gpu_temp) = (None, None, None);
-                        if let Ok(h_entries) = fs::read_dir(device_path.join("hwmon")) {
-                            for h_entry in h_entries.flatten() {
-                                if h_entry.file_name().into_string().unwrap_or_default().starts_with("hwmon") {
-                                    if let Ok(t_str) = fs::read_to_string(h_entry.path().join("temp1_input")) {
-                                        if let Ok(t) = t_str.trim().parse::<f64>() { gpu_temp = Some(t / 1000.0); }
-                                    }
-                                }
-                            }
-                        }
-                        if gpu_temp.is_none() { if let Ok(t_str) = fs::read_to_string("/sys/class/thermal/thermal_zone0/temp") { if let Ok(t) = t_str.trim().parse::<f64>() { gpu_temp = Some(t / 1000.0); } } }
-                        if let Ok(u_str) = fs::read_to_string(device_path.join("mem_info_vram_used")) { mem_used = u_str.trim().parse().ok(); }
-                        if let Ok(t_str) = fs::read_to_string(device_path.join("mem_info_vram_total")) { mem_total = t_str.trim().parse().ok(); }
-                        if mem_used.is_none() {
-                            if let Ok(u_str) = fs::read_to_string(card_path.join("tile0/vram0/used")) { mem_used = u_str.trim().parse().ok(); }
-                            if let Ok(t_str) = fs::read_to_string(card_path.join("tile0/vram0/size")) { mem_total = t_str.trim().parse().ok(); }
-                        }
-                        if mem_used.is_none() && name_str == "VideoCore GPU" {
-                            if let Ok(meminfo) = fs::read_to_string("/proc/meminfo") {
-                                let (mut cma_t, mut cma_f) = (0, 0);
-                                for line in meminfo.lines() {
-                                    if line.starts_with("CmaTotal:") { cma_t = parse_meminfo_kb(line) * 1024; } else if line.starts_with("CmaFree:") { cma_f = parse_meminfo_kb(line) * 1024; }
-                                }
-                                if cma_t > 0 { mem_used = Some(if cma_t > cma_f { cma_t - cma_f } else { 0 }); mem_total = Some(cma_t); }
-                            }
-                        }
-                                                return Some(GpuSnapshot { name: name_str, usage, mem_used, mem_total, temp: gpu_temp });
-                                            }
-                                        }
-                                    }
-                                }
-                        
-                                // 3. Adreno / kgsl
-                                let adreno_paths = [
-                                    "/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage",
-                                    "/sys/class/kgsl/kgsl-3d0/gpubusy",
-                                ];
-                                for p in adreno_paths {
-                                    if let Ok(val_str) = fs::read_to_string(p) {
-                                        let val_str = val_str.trim();
-                                        let usage = if p.contains("gpubusy") {
-                                            let parts: Vec<f64> = val_str.split_whitespace().filter_map(|s| s.parse().ok()).collect();
-                                            if parts.len() >= 2 && parts[1] > 0.0 { Some((parts[0] / parts[1]) * 100.0) } else { None }
-                                        } else {
-                                            val_str.parse().ok()
-                                        };
-                                        if let Some(u) = usage {
-                                            let mut a_temp = None;
-                                            if let Ok(t_str) = fs::read_to_string("/sys/class/thermal/thermal_zone0/temp") {
-                                                if let Ok(t) = t_str.trim().parse::<f64>() { a_temp = Some(t / 1000.0); }
-                                            }
-                                            return Some(GpuSnapshot { name: "Adreno GPU".to_string(), usage: Some(u), mem_used: None, mem_total: None, temp: a_temp });
-                                        }
-                                    }
-                                }
-                        
-                                // 4. Generic devfreq
-                                if let Ok(entries) = fs::read_dir("/sys/class/devfreq") {
-                                    for entry in entries.flatten() {
-                                        let df_name = entry.file_name().into_string().unwrap_or_default();
-                                        if df_name.contains("v3d") || df_name.contains("gpu") || df_name.contains("mali") {
-                                            if let Ok(load_str) = fs::read_to_string(entry.path().join("load")) {
-                                                if let Some(usage_part) = load_str.trim().split('@').next() {
-                                                    if let Ok(u) = usage_part.parse::<f64>() {
-                                                        let mut g_temp = None;
-                                                        if let Ok(t_str) = fs::read_to_string("/sys/class/thermal/thermal_zone0/temp") {
-                                                            if let Ok(t) = t_str.trim().parse::<f64>() { g_temp = Some(t / 1000.0); }
-                                                        }
-                                                        let name = if df_name.contains("v3d") { "VideoCore GPU" } else if df_name.contains("mali") { "Mali GPU" } else { "GPU" };
-                                                        return Some(GpuSnapshot { name: name.to_string(), usage: Some(u), mem_used: None, mem_total: None, temp: g_temp });
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                        
-                                self.last_nvidia_gpu.clone()
-                            }
+        self.last_gpu = None;
+        None
+    }
                         
 
     fn read_processes(&mut self, cpu_delta_total: u64, sort_mode: SortMode, filter: &str) -> Vec<ProcessInfo> {
