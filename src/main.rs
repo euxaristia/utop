@@ -39,6 +39,8 @@ struct MemorySnapshot {
     total_bytes: u64,
     swap_used_bytes: u64,
     swap_total_bytes: u64,
+    cma_used_bytes: u64,
+    cma_total_bytes: u64,
 }
 
 impl MemorySnapshot {
@@ -49,6 +51,10 @@ impl MemorySnapshot {
     fn mem_percent(&self) -> f64 {
         if self.total_bytes == 0 { return 0.0; }
         ((self.used_bytes as f64 / self.total_bytes as f64) * 100.0).min(100.0)
+    }
+    fn cma_percent(&self) -> f64 {
+        if self.cma_total_bytes == 0 { return 0.0; }
+        ((self.cma_used_bytes as f64 / self.cma_total_bytes as f64) * 100.0).min(100.0)
     }
 }
 
@@ -390,7 +396,11 @@ impl Sampler {
             else if line.starts_with("CmaFree:") { cma_f = parse_meminfo_kb(line); }
         }
         if cma_t > 0 {
-            self.cma_info = (Some(if cma_t > cma_f { (cma_t - cma_f) * 1024 } else { 0 }), Some(cma_t * 1024));
+            let used = if cma_t > cma_f { (cma_t - cma_f) * 1024 } else { 0 };
+            let total = cma_t * 1024;
+            self.cma_info = (Some(used), Some(total));
+            snapshot.cma_used_bytes = used;
+            snapshot.cma_total_bytes = total;
         } else {
             self.cma_info = (None, None);
         }
@@ -681,8 +691,20 @@ fn render(cpu: f64, cpu_temp: Option<f64>, cpu_freq: Option<f64>, mem: &MemorySn
     append_line(&mut out, &format!("CPU: {:5.1}%{}{}", cpu, freq_str, cpu_temp.map(|t| format!(" {:4.1}°C", t)).unwrap_or_default()), cols, false);
     append_line(&mut out, &format!("MEM: {:5.1}%  {} / {}", mem.mem_percent(), human_bytes(mem.used_bytes), human_bytes(mem.total_bytes)), cols, false);
     append_line(&mut out, &format!("SWP: {:5.1}%  {} / {}", mem.swap_percent(), human_bytes(mem.swap_used_bytes), human_bytes(mem.swap_total_bytes)), cols, false);
+    
+    let show_cma = mem.cma_total_bytes > 0 && match gpu {
+        Some(g) => g.mem_total != Some(mem.cma_total_bytes),
+        None => true,
+    };
+    if show_cma {
+        append_line(&mut out, &format!("CMA: {:5.1}%  {} / {}", mem.cma_percent(), human_bytes(mem.cma_used_bytes), human_bytes(mem.cma_total_bytes)), cols, false);
+    }
+
     if let Some(g) = gpu {
-        let vram = if let (Some(u), Some(t)) = (g.mem_used, g.mem_total) { format!("  VRAM: {} / {}", human_bytes(u), human_bytes(t)) } else { "".to_string() };
+        let vram = if let (Some(u), Some(t)) = (g.mem_used, g.mem_total) {
+            let p = if t > 0 { format!("{:5.1}%  ", (u as f64 / t as f64) * 100.0) } else { "".to_string() };
+            format!("  VRAM: {}{} / {}", p, human_bytes(u), human_bytes(t))
+        } else { "".to_string() };
         append_line(&mut out, &format!("{}: {}{}{}", g.name, g.usage.map(|u| format!("{:5.1}%", u)).unwrap_or_else(|| " - %".to_string()), g.temp.map(|t| format!(" {:4.1}°C", t)).unwrap_or_default(), vram), cols, false);
     } else { append_line(&mut out, "GPU: - %", cols, false); }
     append_line(&mut out, &format!("NET: {}  rx {}/s  tx {}/s", net.iface, human_bytes(net.rx_rate as u64), human_bytes(net.tx_rate as u64)), cols, false);
