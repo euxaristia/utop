@@ -41,17 +41,13 @@ struct MemorySnapshot {
 }
 
 impl MemorySnapshot {
-    fn combined_used(&self) -> u64 { self.used_bytes + self.swap_used_bytes }
-    fn combined_total(&self) -> u64 { self.total_bytes + self.swap_total_bytes }
-
     fn swap_percent(&self) -> f64 {
         if self.swap_total_bytes == 0 { return 0.0; }
         ((self.swap_used_bytes as f64 / self.swap_total_bytes as f64) * 100.0).min(100.0)
     }
-    fn combined_percent(&self) -> f64 {
-        let total = self.combined_total();
-        if total == 0 { return 0.0; }
-        ((self.combined_used() as f64 / total as f64) * 100.0).min(100.0)
+    fn mem_percent(&self) -> f64 {
+        if self.total_bytes == 0 { return 0.0; }
+        ((self.used_bytes as f64 / self.total_bytes as f64) * 100.0).min(100.0)
     }
 }
 
@@ -609,7 +605,7 @@ fn render(cpu: f64, cpu_temp: Option<f64>, cpu_freq: Option<f64>, mem: &MemorySn
     append_line(&mut out, &format!("utop    CPUs: {}", cpu_count), cols, false);
     let freq_str = cpu_freq.map(|f| format!(" @ {:.2} GHz", f / 1000.0)).unwrap_or_default();
     append_line(&mut out, &format!("CPU: {:5.1}%{}{}", cpu, freq_str, cpu_temp.map(|t| format!(" {:4.1}°C", t)).unwrap_or_default()), cols, false);
-    append_line(&mut out, &format!("MEM: {:5.1}%  {} / {}", mem.combined_percent(), human_bytes(mem.combined_used()), human_bytes(mem.combined_total())), cols, false);
+    append_line(&mut out, &format!("MEM: {:5.1}%  {} / {}", mem.mem_percent(), human_bytes(mem.used_bytes), human_bytes(mem.total_bytes)), cols, false);
     append_line(&mut out, &format!("SWP: {:5.1}%  {} / {}", mem.swap_percent(), human_bytes(mem.swap_used_bytes), human_bytes(mem.swap_total_bytes)), cols, false);
     if let Some(g) = gpu {
         let vram = if let (Some(u), Some(t)) = (g.mem_used, g.mem_total) { format!("  VRAM: {} / {}", human_bytes(u), human_bytes(t)) } else { "".to_string() };
