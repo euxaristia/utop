@@ -346,12 +346,14 @@ int main() {
             while ((k = read_key()).type != K_NONE) {
                 if (k.type == K_QUIT) { restore_terminal(); return 0; }
                 if (is_search) {
-                    if (k.type == K_ESC || k.type == K_ENTER) is_search = false;
+                    if (k.type == K_ESC || k.type == K_ENTER) { is_search = false; needs_render = true; }
                     else if (k.type == K_BACKSPACE) { 
                         if (strlen(filter) > 0) { filter[strlen(filter)-1] = 0; selection = 0; needs_sample = true; } 
-                        else { is_search = false; }
+                        else { is_search = false; needs_render = true; }
                     }
-                    else if (k.type == K_CHAR) { if (strlen(filter) < 63) { size_t l = strlen(filter); filter[l] = k.ch; filter[l+1] = 0; selection = 0; needs_sample = true; } }
+                    else if (k.type == K_CHAR) { 
+                        if (strlen(filter) < 63) { size_t l = strlen(filter); filter[l] = k.ch; filter[l+1] = 0; selection = 0; needs_sample = true; } 
+                    }
                 } else {
                     if (k.type == K_UP) { if (selection > 0) selection--; needs_render = true; }
                     else if (k.type == K_DOWN) { selection++; needs_render = true; }
@@ -364,7 +366,7 @@ int main() {
                         if (k.ch == 'k') { if (selection > 0) selection--; needs_render = true; }
                         if (k.ch == 'h') { sort = SORT_CPU; needs_sample = true; }
                         if (k.ch == 'l') { sort = SORT_MEM; needs_sample = true; }
-                        if (k.ch == '/') { is_search = true; filter[0] = 0; }
+                        if (k.ch == '/') { is_search = true; filter[0] = 0; needs_render = true; }
                     }
                 }
             }

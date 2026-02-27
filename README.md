@@ -1,35 +1,35 @@
 # utop
 
-`utop` is a pure Rust terminal system monitor for Linux.
+`utop` is a high-performance terminal system monitor for Linux, written in pure C.
 
-- No third-party TUI libraries (uses `libc` for terminal control).
+- Zero-allocation process sampling for maximum speed.
+- No third-party TUI libraries (uses ANSI escape sequences).
 - Data source is Linux `/proc` and `/sys`.
-- Rendering is ANSI terminal output.
 
 ## Features
 
-- Real-time CPU usage, Frequency & Temperature
-- Memory & Swap usage
-- GPU usage (NVIDIA, AMD, Intel, VideoCore, Adreno)
-- Network throughput
-- Process table with sorting (CPU/Memory)
-- Search/Filter support
+- Real-time CPU & Memory usage.
+- Process table with smooth scrolling.
+- Sorting by CPU or Memory.
+- Instant search/filter support.
+- Adaptive layout (scales to terminal size).
 
 ## Requirements
 
 - Linux
-- Rust (Cargo)
+- A C compiler (Clang recommended)
+- Make
 
 ## Build
 
 ```bash
-cargo build --release
+make
 ```
 
 ## Run
 
 ```bash
-./target/release/utop
+./utop
 ```
 
 ## Controls
