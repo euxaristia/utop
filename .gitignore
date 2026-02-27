@@ -3,3 +3,4 @@ Cargo.lock
 .build/
 .swiftpm/
 swift_output.txt
+utop

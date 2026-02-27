@@ -91,6 +91,12 @@ typedef struct {
 } PidTicks;
 
 typedef struct {
+    char queue[32];
+    unsigned long long last_ts;
+    unsigned long long last_rt;
+} V3dStats;
+
+typedef struct {
     CpuTimes prev_cpu;
     PidTicks *prev_ticks;
     size_t prev_ticks_count;
@@ -98,6 +104,8 @@ typedef struct {
     size_t prev_net_count;
     struct timeval last_sample;
     long page_size;
+    V3dStats v3d_stats[16];
+    int v3d_stats_count;
 } Sampler;
 
 Sampler* sampler_create() {
@@ -110,11 +118,14 @@ Sampler* sampler_create() {
 // --- Utilities ---
 
 char* human_bytes(unsigned long long bytes) {
-    static char buf[32];
+    static char bufs[8][32];
+    static int idx = 0;
+    idx = (idx + 1) % 8;
+    char *buf = bufs[idx];
     double v = (double)bytes;
-    if (v >= 1024*1024*1024) sprintf(buf, "%.2f GiB", v / (1024*1024*1024));
-    else if (v >= 1024*1024) sprintf(buf, "%.1f MiB", v / (1024*1024));
-    else if (v >= 1024) sprintf(buf, "%.1f KiB", v / 1024);
+    if (v >= 1024.0*1024*1024) sprintf(buf, "%.2f GiB", v / (1024.0*1024*1024));
+    else if (v >= 1024.0*1024) sprintf(buf, "%.1f MiB", v / (1024.0*1024));
+    else if (v >= 1024.0) sprintf(buf, "%.1f KiB", v / 1024.0);
     else sprintf(buf, "%llu B", bytes);
     return buf;
 }
@@ -285,7 +296,7 @@ int read_cpu_count() {
     return count > 0 ? count : 1;
 }
 
-GpuSnapshot read_gpu(MemorySnapshot mem) {
+GpuSnapshot read_gpu(Sampler *s, MemorySnapshot mem) {
     static GpuSnapshot cached_gpu = {"GPU", 0, 0, 0, -1000.0, false, false, false};
     static struct timeval last_gpu_read = {0, 0};
     struct timeval now;
@@ -330,6 +341,8 @@ GpuSnapshot read_gpu(MemorySnapshot mem) {
             if (strncmp(entry->d_name, "card", 4) == 0 && !strchr(entry->d_name, '-')) {
                 char path[512];
                 bool found_usage = false;
+
+                // Try common usage files
                 const char *usage_files[] = {
                     "/sys/class/drm/%s/device/gpu_busy_percent",
                     "/sys/class/drm/%s/gt/gt0/usage",
@@ -349,48 +362,199 @@ GpuSnapshot read_gpu(MemorySnapshot mem) {
                     }
                 }
 
-                if (found_usage) {
-                    snprintf(path, sizeof(path), "/sys/class/drm/%s/device/vendor", entry->d_name);
-                    FILE *f = fopen(path, "r");
-                    if (f) {
-                        char vendor[32]; if (fgets(vendor, sizeof(vendor), f)) {
-                            if (strstr(vendor, "0x1002")) strcpy(g.name, "AMD GPU");
-                            else if (strstr(vendor, "0x8086")) strcpy(g.name, "Intel GPU");
-                            else if (strstr(vendor, "0x10de")) strcpy(g.name, "NVIDIA GPU");
-                            else if (strstr(vendor, "0x14e4")) strcpy(g.name, "Broadcom GPU");
+                // Try gpu_stats (v3d)
+                if (!found_usage) {
+                    snprintf(path, sizeof(path), "/sys/class/drm/%s/device/gpu_stats", entry->d_name);
+                    FILE *f_stats = fopen(path, "r");
+                    if (!f_stats) {
+                        // Fallback to debugfs
+                        char card_num = entry->d_name[4]; // card0 -> '0'
+                        if (isdigit(card_num)) {
+                            snprintf(path, sizeof(path), "/sys/kernel/debug/dri/%c/gpu_stats", card_num);
+                            f_stats = fopen(path, "r");
                         }
-                        fclose(f);
                     }
-                    
-                    snprintf(path, sizeof(path), "/sys/class/drm/%s/device/hwmon", entry->d_name);
-                    DIR *hdir = opendir(path);
-                    if (hdir) {
-                        struct dirent *hentry;
-                        while ((hentry = readdir(hdir))) {
-                            if (strncmp(hentry->d_name, "hwmon", 5) == 0) {
-                                char tpath[512];
-                                snprintf(tpath, sizeof(tpath), "/sys/class/drm/%s/device/hwmon/%s/temp1_input", entry->d_name, hentry->d_name);
-                                FILE *tf = fopen(tpath, "r");
-                                if (tf) {
-                                    if (fscanf(tf, "%lf", &g.temp) == 1) { g.temp /= 1000.0; g.has_temp = true; }
-                                    fclose(tf); break;
+                    if (f_stats) {
+                        char line[256];
+                        fgets(line, sizeof(line), f_stats); // skip header
+                        while (fgets(line, sizeof(line), f_stats)) {
+                            char q_name[32];
+                            unsigned long long ts, rt;
+                            if (sscanf(line, "%s %llu %*u %llu", q_name, &ts, &rt) == 3) {
+                                int idx = -1;
+                                for (int k = 0; k < s->v3d_stats_count; k++) {
+                                    if (strcmp(s->v3d_stats[k].queue, q_name) == 0) { idx = k; break; }
+                                }
+                                if (idx == -1 && s->v3d_stats_count < 16) {
+                                    idx = s->v3d_stats_count++;
+                                    strcpy(s->v3d_stats[idx].queue, q_name);
+                                    s->v3d_stats[idx].last_ts = ts;
+                                    s->v3d_stats[idx].last_rt = rt;
+                                } else if (idx != -1) {
+                                    if (ts > s->v3d_stats[idx].last_ts) {
+                                        double q_u = (double)(rt - s->v3d_stats[idx].last_rt) * 100.0 / (ts - s->v3d_stats[idx].last_ts);
+                                        if (q_u > g.usage) g.usage = q_u;
+                                        g.has_usage = true; found_usage = true;
+                                    }
+                                    s->v3d_stats[idx].last_ts = ts;
+                                    s->v3d_stats[idx].last_rt = rt;
                                 }
                             }
                         }
-                        closedir(hdir);
+                        fclose(f_stats);
                     }
+                }
 
-                    if (strcmp(g.name, "Broadcom GPU") == 0 || strcmp(g.name, "GPU") == 0) {
-                        if (mem.cma_total_bytes > 0) {
-                            g.mem_used = mem.cma_used_bytes; g.mem_total = mem.cma_total_bytes; g.has_mem = true;
-                            if (strcmp(g.name, "GPU") == 0) strcpy(g.name, "VideoCore GPU");
+                // Determine GPU name
+                snprintf(path, sizeof(path), "/sys/class/drm/%s/device/vendor", entry->d_name);
+                FILE *fv = fopen(path, "r");
+                if (fv) {
+                    char vendor[32]; if (fgets(vendor, sizeof(vendor), fv)) {
+                        if (strstr(vendor, "0x1002")) strcpy(g.name, "AMD GPU");
+                        else if (strstr(vendor, "0x8086")) strcpy(g.name, "Intel GPU");
+                        else if (strstr(vendor, "0x10de")) strcpy(g.name, "NVIDIA GPU");
+                        else if (strstr(vendor, "0x14e4")) strcpy(g.name, "Broadcom GPU");
+                    }
+                    fclose(fv);
+                } else {
+                    // Check uevent for driver name
+                    snprintf(path, sizeof(path), "/sys/class/drm/%s/device/uevent", entry->d_name);
+                    FILE *fe = fopen(path, "r");
+                    if (fe) {
+                        char line[256];
+                        while (fgets(line, sizeof(line), fe)) {
+                            if (strstr(line, "DRIVER=v3d") || strstr(line, "DRIVER=vc4")) {
+                                strcpy(g.name, "VideoCore GPU"); break;
+                            }
+                        }
+                        fclose(fe);
+                    }
+                }
+
+                // GPU Temp
+                snprintf(path, sizeof(path), "/sys/class/drm/%s/device/hwmon", entry->d_name);
+                DIR *hdir = opendir(path);
+                if (hdir) {
+                    struct dirent *hentry;
+                    while ((hentry = readdir(hdir))) {
+                        if (strncmp(hentry->d_name, "hwmon", 5) == 0) {
+                            char tpath[512];
+                            snprintf(tpath, sizeof(tpath), "/sys/class/drm/%s/device/hwmon/%s/temp1_input", entry->d_name, hentry->d_name);
+                            FILE *tf = fopen(tpath, "r");
+                            if (tf) {
+                                if (fscanf(tf, "%lf", &g.temp) == 1) { g.temp /= 1000.0; g.has_temp = true; }
+                                fclose(tf); break;
+                            }
                         }
                     }
+                    closedir(hdir);
+                }
+                if (!g.has_temp) {
+                    FILE *tf = fopen("/sys/class/thermal/thermal_zone0/temp", "r");
+                    if (tf) { if (fscanf(tf, "%lf", &g.temp) == 1) { g.temp /= 1000.0; g.has_temp = true; } fclose(tf); }
+                }
+
+                // VRAM for Intel and others
+                if (!g.has_mem) {
+                    snprintf(path, sizeof(path), "/sys/class/drm/%s/tile0/vram0/used", entry->d_name);
+                    FILE *fm = fopen(path, "r");
+                    if (fm) { if (fscanf(fm, "%llu", &g.mem_used) == 1) g.has_mem = true; fclose(fm); }
+                    snprintf(path, sizeof(path), "/sys/class/drm/%s/tile0/vram0/size", entry->d_name);
+                    fm = fopen(path, "r");
+                    if (fm) { fscanf(fm, "%llu", &g.mem_total); fclose(fm); }
+                }
+
+                // VRAM for VideoCore
+                if (strcmp(g.name, "Broadcom GPU") == 0 || strcmp(g.name, "VideoCore GPU") == 0 || strcmp(g.name, "GPU") == 0) {
+                    if (mem.cma_total_bytes > 0) {
+                        g.mem_used = mem.cma_used_bytes; g.mem_total = mem.cma_total_bytes; g.has_mem = true;
+                        if (strcmp(g.name, "GPU") == 0) strcpy(g.name, "VideoCore GPU");
+                    }
+                }
+                
+                if (g.has_usage) {
                     closedir(dir); cached_gpu = g; return g;
                 }
             }
         }
         closedir(dir);
+    }
+
+    // 3. Adreno / kgsl
+    const char *adreno_paths[] = {
+        "/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage",
+        "/sys/class/kgsl/kgsl-3d0/gpubusy"
+    };
+    for (int i = 0; i < 2; i++) {
+        FILE *f = fopen(adreno_paths[i], "r");
+        if (f) {
+            double usage = 0;
+            if (i == 1) { // gpubusy
+                unsigned long long busy, total;
+                if (fscanf(f, "%llu %llu", &busy, &total) == 2 && total > 0) usage = (double)busy * 100.0 / total;
+            } else {
+                fscanf(f, "%lf", &usage);
+            }
+            fclose(f);
+            if (usage > 0 || i == 0) {
+                strcpy(g.name, "Adreno GPU"); g.usage = usage; g.has_usage = true;
+                FILE *tf = fopen("/sys/class/thermal/thermal_zone0/temp", "r");
+                if (tf) { if (fscanf(tf, "%lf", &g.temp) == 1) { g.temp /= 1000.0; g.has_temp = true; } fclose(tf); }
+                cached_gpu = g; return g;
+            }
+        }
+    }
+
+    // 4. Generic devfreq (and RPI specific paths)
+    const char *devfreq_dirs[] = {
+        "/sys/class/devfreq",
+        "/sys/devices/platform/soc/soc:gpu/devfreq"
+    };
+    for (int d = 0; d < 2; d++) {
+        dir = opendir(devfreq_dirs[d]);
+        if (dir) {
+            struct dirent *entry;
+            while ((entry = readdir(dir))) {
+                if (strstr(entry->d_name, "v3d") || strstr(entry->d_name, "gpu") || strstr(entry->d_name, "mali") || strstr(entry->d_name, "soc:gpu")) {
+                    char path[512];
+                    snprintf(path, sizeof(path), "%s/%s/load", devfreq_dirs[d], entry->d_name);
+                    FILE *f = fopen(path, "r");
+                    if (f) {
+                        char load_buf[64];
+                        if (fgets(load_buf, sizeof(load_buf), f)) {
+                            char *at = strchr(load_buf, '@');
+                            if (at) *at = '\0';
+                            g.usage = atof(load_buf);
+                            g.has_usage = true;
+                            if (strstr(entry->d_name, "v3d") || strstr(entry->d_name, "soc:gpu")) strcpy(g.name, "VideoCore GPU");
+                            else if (strstr(entry->d_name, "mali")) strcpy(g.name, "Mali GPU");
+                            else if (strcmp(g.name, "GPU") == 0) strcpy(g.name, "GPU");
+                            
+                            fclose(f);
+                            if (!g.has_temp) {
+                                FILE *tf = fopen("/sys/class/thermal/thermal_zone0/temp", "r");
+                                if (tf) { if (fscanf(tf, "%lf", &g.temp) == 1) { g.temp /= 1000.0; g.has_temp = true; } fclose(tf); }
+                            }
+                            closedir(dir); cached_gpu = g; return g;
+                        }
+                        fclose(f);
+                    }
+                }
+            }
+            closedir(dir);
+        }
+    }
+
+    // 5. Fallback for SoC (Broadcom/VideoCore) if DRM didn't pick it up
+    if (!g.has_usage && !g.has_mem && mem.cma_total_bytes > 0) {
+        strcpy(g.name, "VideoCore GPU");
+        g.mem_used = mem.cma_used_bytes;
+        g.mem_total = mem.cma_total_bytes;
+        g.has_mem = true;
+        if (!g.has_temp) {
+            FILE *tf = fopen("/sys/class/thermal/thermal_zone0/temp", "r");
+            if (tf) { if (fscanf(tf, "%lf", &g.temp) == 1) { g.temp /= 1000.0; g.has_temp = true; } fclose(tf); }
+        }
     }
 
     cached_gpu = g;
@@ -479,7 +643,7 @@ void sample(Sampler *s, SortMode sort, const char *filter, ProcessInfo **out_pro
     *out_cpu = total_delta > 0 ? (double)(total_delta - idle_delta) * 100.0 / total_delta : 0;
     *out_mem = read_memory();
     *out_net = read_network(s, elapsed);
-    *out_gpu = read_gpu(*out_mem);
+    *out_gpu = read_gpu(s, *out_mem);
     *out_cpus = read_cpu_count();
 
     DIR *dir = opendir("/proc");
@@ -652,13 +816,14 @@ int main() {
                 printf("CMA: %5.1f%% %s / %s\x1B[K\n", (double)mem.cma_used_bytes * 100.0 / mem.cma_total_bytes, human_bytes(mem.cma_used_bytes), human_bytes(mem.cma_total_bytes));
             }
 
-            if (gpu.has_usage) {
-                char g_temp[32] = {0}, g_vram[64] = {0};
+            if (gpu.has_usage || gpu.has_mem) {
+                char g_temp[32] = {0}, g_vram[64] = {0}, g_usage[32] = {0};
                 if (gpu.has_temp) sprintf(g_temp, " %.1f°C", gpu.temp);
                 if (gpu.has_mem) sprintf(g_vram, "  VRAM: %5.1f%% %s / %s", (double)gpu.mem_used * 100.0 / gpu.mem_total, human_bytes(gpu.mem_used), human_bytes(gpu.mem_total));
-                printf("%s: %5.1f%%%s%s\x1B[K\n", gpu.name, gpu.usage, g_temp, g_vram);
+                if (gpu.has_usage) sprintf(g_usage, "%5.1f%%", gpu.usage);
+                printf("%s: %s%s%s\x1B[K\n", gpu.name, g_usage, g_temp, g_vram);
             } else {
-                printf("GPU: - %%\x1B[K\n");
+                printf("GPU:\x1B[K\n");
             }
 
             printf("NET: %s  rx %s/s  tx %s/s\x1B[K\n", net.iface, human_bytes((unsigned long long)net.rx_rate), human_bytes((unsigned long long)net.tx_rate));
