@@ -23,7 +23,16 @@ typedef struct {
 typedef struct {
     unsigned long long used_bytes, total_bytes;
     unsigned long long swap_used_bytes, swap_total_bytes;
+    unsigned long long cma_used_bytes, cma_total_bytes;
 } MemorySnapshot;
+
+typedef struct {
+    char name[64];
+    double usage;
+    unsigned long long mem_used, mem_total;
+    double temp;
+    bool has_usage, has_mem, has_temp;
+} GpuSnapshot;
 
 typedef struct {
     int pid;
@@ -34,6 +43,16 @@ typedef struct {
 } ProcessInfo;
 
 typedef enum { SORT_CPU, SORT_MEM } SortMode;
+
+typedef struct {
+    char iface[32];
+    double rx_rate, tx_rate;
+} NetworkSnapshot;
+
+typedef struct {
+    char iface[32];
+    unsigned long long rx, tx;
+} NetStats;
 
 // --- Global State ---
 
@@ -75,6 +94,8 @@ typedef struct {
     CpuTimes prev_cpu;
     PidTicks *prev_ticks;
     size_t prev_ticks_count;
+    NetStats *prev_net;
+    size_t prev_net_count;
     struct timeval last_sample;
     long page_size;
 } Sampler;
@@ -100,6 +121,121 @@ char* human_bytes(unsigned long long bytes) {
 
 // --- Implementation ---
 
+double read_cpu_temp() {
+    DIR *dir = opendir("/sys/class/thermal");
+    if (dir) {
+        struct dirent *entry;
+        while ((entry = readdir(dir))) {
+            if (strncmp(entry->d_name, "thermal_zone", 12) == 0) {
+                char path[512];
+                snprintf(path, sizeof(path), "/sys/class/thermal/%s/type", entry->d_name);
+                FILE *f = fopen(path, "r");
+                if (f) {
+                    char type[256];
+                    if (fgets(type, sizeof(type), f)) {
+                        for (int i = 0; type[i]; i++) type[i] = tolower(type[i]);
+                        if (strstr(type, "pkg") || strstr(type, "cpu") || strstr(type, "core") || strstr(type, "soc")) {
+                            fclose(f);
+                            snprintf(path, sizeof(path), "/sys/class/thermal/%s/temp", entry->d_name);
+                            f = fopen(path, "r");
+                            if (f) {
+                                double t;
+                                if (fscanf(f, "%lf", &t) == 1) { fclose(f); closedir(dir); return t / 1000.0; }
+                                fclose(f);
+                            }
+                        } else fclose(f);
+                    } else fclose(f);
+                }
+            }
+        }
+        closedir(dir);
+    }
+    // Fallback to hwmon
+    dir = opendir("/sys/class/hwmon");
+    if (dir) {
+        struct dirent *entry;
+        while ((entry = readdir(dir))) {
+            char path[512];
+            snprintf(path, sizeof(path), "/sys/class/hwmon/%s/name", entry->d_name);
+            FILE *f = fopen(path, "r");
+            if (f) {
+                char name[256];
+                if (fgets(name, sizeof(name), f)) {
+                    for (int i = 0; name[i]; i++) name[i] = tolower(name[i]);
+                    if (strstr(name, "coretemp") || strstr(name, "cpu") || strstr(name, "k10temp")) {
+                        fclose(f);
+                        char subpath[512];
+                        snprintf(subpath, sizeof(subpath), "/sys/class/hwmon/%s", entry->d_name);
+                        DIR *subdir = opendir(subpath);
+                        if (subdir) {
+                            struct dirent *subentry;
+                            double best = -1000.0;
+                            while ((subentry = readdir(subdir))) {
+                                if (strncmp(subentry->d_name, "temp", 4) == 0 && strstr(subentry->d_name, "_input")) {
+                                    char fpath[512];
+                                    snprintf(fpath, sizeof(fpath), "%s/%s", subpath, subentry->d_name);
+                                    FILE *sf = fopen(fpath, "r");
+                                    if (sf) {
+                                        double t;
+                                        if (fscanf(sf, "%lf", &t) == 1) { if (t/1000.0 > best) best = t/1000.0; }
+                                        fclose(sf);
+                                    }
+                                }
+                            }
+                            closedir(subdir);
+                            if (best > -1000.0) { closedir(dir); return best; }
+                        }
+                    } else fclose(f);
+                } else fclose(f);
+            }
+        }
+        closedir(dir);
+    }
+    return -1000.0;
+}
+
+double read_cpu_freq() {
+    FILE *f = fopen("/proc/cpuinfo", "r");
+    if (f) {
+        char line[256];
+        double total = 0;
+        int count = 0;
+        while (fgets(line, sizeof(line), f)) {
+            if (strncmp(line, "cpu MHz", 7) == 0) {
+                char *p = strchr(line, ':');
+                if (p) {
+                    double freq;
+                    if (sscanf(p + 1, "%lf", &freq) == 1) { total += freq; count++; }
+                }
+            }
+        }
+        fclose(f);
+        if (count > 0) return total / count;
+    }
+    // Fallback sysfs
+    DIR *dir = opendir("/sys/devices/system/cpu");
+    if (dir) {
+        struct dirent *entry;
+        double total = 0;
+        int count = 0;
+        while ((entry = readdir(dir))) {
+            if (strncmp(entry->d_name, "cpu", 3) == 0 && isdigit(entry->d_name[3])) {
+                char path[512];
+                snprintf(path, sizeof(path), "/sys/devices/system/cpu/%s/cpufreq/scaling_cur_freq", entry->d_name);
+                FILE *f = fopen(path, "r");
+                if (f) {
+                    double khz;
+                    if (fscanf(f, "%lf", &khz) == 1) { total += khz / 1000.0; count++; }
+                    fclose(f);
+                }
+            }
+        }
+        closedir(dir);
+        if (count > 0) return total / count;
+    }
+    return 0;
+}
+
 CpuTimes read_cpu_times() {
     CpuTimes t = {0};
     FILE *f = fopen("/proc/stat", "r");
@@ -118,19 +254,147 @@ MemorySnapshot read_memory() {
     FILE *f = fopen("/proc/meminfo", "r");
     if (!f) return m;
     char line[256];
-    unsigned long long total = 0, avail = 0, s_total = 0, s_free = 0;
+    unsigned long long total = 0, avail = 0, s_total = 0, s_free = 0, cma_total = 0, cma_free = 0;
     while (fgets(line, sizeof(line), f)) {
         if (strncmp(line, "MemTotal:", 9) == 0) sscanf(line + 9, "%llu", &total);
         else if (strncmp(line, "MemAvailable:", 13) == 0) sscanf(line + 13, "%llu", &avail);
         else if (strncmp(line, "SwapTotal:", 10) == 0) sscanf(line + 10, "%llu", &s_total);
         else if (strncmp(line, "SwapFree:", 9) == 0) sscanf(line + 9, "%llu", &s_free);
+        else if (strncmp(line, "CmaTotal:", 9) == 0) sscanf(line + 9, "%llu", &cma_total);
+        else if (strncmp(line, "CmaFree:", 8) == 0) sscanf(line + 8, "%llu", &cma_free);
     }
     fclose(f);
     m.total_bytes = total * 1024;
     m.used_bytes = (total - avail) * 1024;
     m.swap_total_bytes = s_total * 1024;
     m.swap_used_bytes = (s_total - s_free) * 1024;
+    m.cma_total_bytes = cma_total * 1024;
+    m.cma_used_bytes = (cma_total - cma_free) * 1024;
     return m;
+}
+
+int read_cpu_count() {
+    FILE *f = fopen("/proc/stat", "r");
+    if (!f) return 1;
+    char line[256];
+    int count = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "cpu", 3) == 0 && isdigit(line[3])) count++;
+    }
+    fclose(f);
+    return count > 0 ? count : 1;
+}
+
+GpuSnapshot read_gpu(MemorySnapshot mem) {
+    static GpuSnapshot cached_gpu = {"GPU", 0, 0, 0, -1000.0, false, false, false};
+    static struct timeval last_gpu_read = {0, 0};
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    
+    long long ms_diff = (now.tv_sec - last_gpu_read.tv_sec) * 1000 + (now.tv_usec - last_gpu_read.tv_usec) / 1000;
+    if (ms_diff < 800 && last_gpu_read.tv_sec != 0) return cached_gpu;
+    last_gpu_read = now;
+
+    GpuSnapshot g = {"GPU", 0, 0, 0, -1000.0, false, false, false};
+    
+    // 1. NVIDIA via nvidia-smi
+    FILE *fp = popen("/usr/bin/nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu --format=csv,noheader,nounits 2>/dev/null", "r");
+    if (fp) {
+        char buf[256];
+        if (fgets(buf, sizeof(buf), fp)) {
+            char *token, *saveptr;
+            int field = 0;
+            token = strtok_r(buf, ",", &saveptr);
+            while (token) {
+                while(isspace(*token)) token++;
+                if (field == 0) { g.usage = atof(token); g.has_usage = true; }
+                else if (field == 1) { g.mem_used = (unsigned long long)atoll(token) * 1024 * 1024; g.has_mem = true; }
+                else if (field == 2) { g.mem_total = (unsigned long long)atoll(token) * 1024 * 1024; }
+                else if (field == 3) { g.temp = atof(token); g.has_temp = true; }
+                token = strtok_r(NULL, ",", &saveptr);
+                field++;
+            }
+            if (g.has_usage) {
+                strcpy(g.name, "NVIDIA GPU");
+                pclose(fp); cached_gpu = g; return g;
+            }
+        }
+        pclose(fp);
+    }
+
+    // 2. DRM / sysfs
+    DIR *dir = opendir("/sys/class/drm");
+    if (dir) {
+        struct dirent *entry;
+        while ((entry = readdir(dir))) {
+            if (strncmp(entry->d_name, "card", 4) == 0 && !strchr(entry->d_name, '-')) {
+                char path[512];
+                bool found_usage = false;
+                const char *usage_files[] = {
+                    "/sys/class/drm/%s/device/gpu_busy_percent",
+                    "/sys/class/drm/%s/gt/gt0/usage",
+                    "/sys/class/drm/%s/device/usage",
+                    "/sys/class/drm/%s/device/load"
+                };
+                
+                for (int i = 0; i < 4; i++) {
+                    snprintf(path, sizeof(path), usage_files[i], entry->d_name);
+                    FILE *f = fopen(path, "r");
+                    if (f) {
+                        if (fscanf(f, "%lf", &g.usage) == 1) {
+                            g.has_usage = true; found_usage = true;
+                            fclose(f); break;
+                        }
+                        fclose(f);
+                    }
+                }
+
+                if (found_usage) {
+                    snprintf(path, sizeof(path), "/sys/class/drm/%s/device/vendor", entry->d_name);
+                    FILE *f = fopen(path, "r");
+                    if (f) {
+                        char vendor[32]; if (fgets(vendor, sizeof(vendor), f)) {
+                            if (strstr(vendor, "0x1002")) strcpy(g.name, "AMD GPU");
+                            else if (strstr(vendor, "0x8086")) strcpy(g.name, "Intel GPU");
+                            else if (strstr(vendor, "0x10de")) strcpy(g.name, "NVIDIA GPU");
+                            else if (strstr(vendor, "0x14e4")) strcpy(g.name, "Broadcom GPU");
+                        }
+                        fclose(f);
+                    }
+                    
+                    snprintf(path, sizeof(path), "/sys/class/drm/%s/device/hwmon", entry->d_name);
+                    DIR *hdir = opendir(path);
+                    if (hdir) {
+                        struct dirent *hentry;
+                        while ((hentry = readdir(hdir))) {
+                            if (strncmp(hentry->d_name, "hwmon", 5) == 0) {
+                                char tpath[512];
+                                snprintf(tpath, sizeof(tpath), "/sys/class/drm/%s/device/hwmon/%s/temp1_input", entry->d_name, hentry->d_name);
+                                FILE *tf = fopen(tpath, "r");
+                                if (tf) {
+                                    if (fscanf(tf, "%lf", &g.temp) == 1) { g.temp /= 1000.0; g.has_temp = true; }
+                                    fclose(tf); break;
+                                }
+                            }
+                        }
+                        closedir(hdir);
+                    }
+
+                    if (strcmp(g.name, "Broadcom GPU") == 0 || strcmp(g.name, "GPU") == 0) {
+                        if (mem.cma_total_bytes > 0) {
+                            g.mem_used = mem.cma_used_bytes; g.mem_total = mem.cma_total_bytes; g.has_mem = true;
+                            if (strcmp(g.name, "GPU") == 0) strcpy(g.name, "VideoCore GPU");
+                        }
+                    }
+                    closedir(dir); cached_gpu = g; return g;
+                }
+            }
+        }
+        closedir(dir);
+    }
+
+    cached_gpu = g;
+    return g;
 }
 
 int compare_procs(const void *a, const void *b, void *arg) {
@@ -147,7 +411,65 @@ int compare_procs(const void *a, const void *b, void *arg) {
     }
 }
 
-void sample(Sampler *s, SortMode sort, const char *filter, ProcessInfo **out_procs, int *out_count, double *out_cpu, MemorySnapshot *out_mem) {
+NetworkSnapshot read_network(Sampler *s, double elapsed) {
+    NetworkSnapshot best = {"-", 0, 0};
+    FILE *f = fopen("/proc/net/dev", "r");
+    if (!f) return best;
+    char line[512];
+    fgets(line, sizeof(line), f); // skip header
+    fgets(line, sizeof(line), f); // skip header
+    
+    NetStats *cur_net = malloc(16 * sizeof(NetStats));
+    size_t cur_count = 0, cur_cap = 16;
+    unsigned long long best_total = 0;
+
+    while (fgets(line, sizeof(line), f)) {
+        char iface[32];
+        unsigned long long rx, tx;
+        char *p = strchr(line, ':');
+        if (!p) continue;
+        *p = ' ';
+        if (sscanf(line, "%s %llu %*u %*u %*u %*u %*u %*u %*u %llu", iface, &rx, &tx) != 3) continue;
+        if (strcmp(iface, "lo") == 0) continue;
+
+        if (cur_count >= cur_cap) { cur_cap *= 2; cur_net = realloc(cur_net, cur_cap * sizeof(NetStats)); }
+        strcpy(cur_net[cur_count].iface, iface);
+        cur_net[cur_count].rx = rx;
+        cur_net[cur_count].tx = tx;
+        cur_count++;
+
+        unsigned long long prev_rx = rx, prev_tx = tx;
+        for (size_t i = 0; i < s->prev_net_count; i++) {
+            if (strcmp(s->prev_net[i].iface, iface) == 0) {
+                prev_rx = s->prev_net[i].rx;
+                prev_tx = s->prev_net[i].tx;
+                break;
+            }
+        }
+
+        double rx_r = (rx >= prev_rx ? rx - prev_rx : 0) / elapsed;
+        double tx_r = (tx >= prev_tx ? tx - prev_tx : 0) / elapsed;
+        if (rx + tx > best_total) {
+            best_total = rx + tx;
+            strcpy(best.iface, iface);
+            best.rx_rate = rx_r;
+            best.tx_rate = tx_r;
+        }
+    }
+    fclose(f);
+    if (s->prev_net) free(s->prev_net);
+    s->prev_net = cur_net;
+    s->prev_net_count = cur_count;
+    return best;
+}
+
+void sample(Sampler *s, SortMode sort, const char *filter, ProcessInfo **out_procs, int *out_count, double *out_cpu, MemorySnapshot *out_mem, NetworkSnapshot *out_net, GpuSnapshot *out_gpu, int *out_cpus) {
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    double elapsed = (now.tv_sec - s->last_sample.tv_sec) + (now.tv_usec - s->last_sample.tv_usec) / 1000000.0;
+    if (elapsed < 0.001) elapsed = 0.001;
+    s->last_sample = now;
+
     CpuTimes cur_cpu = read_cpu_times();
     unsigned long long total_prev = s->prev_cpu.user + s->prev_cpu.nice + s->prev_cpu.system + s->prev_cpu.idle + s->prev_cpu.iowait + s->prev_cpu.irq + s->prev_cpu.softirq + s->prev_cpu.steal;
     unsigned long long total_cur = cur_cpu.user + cur_cpu.nice + cur_cpu.system + cur_cpu.idle + cur_cpu.iowait + cur_cpu.irq + cur_cpu.softirq + cur_cpu.steal;
@@ -156,6 +478,9 @@ void sample(Sampler *s, SortMode sort, const char *filter, ProcessInfo **out_pro
     
     *out_cpu = total_delta > 0 ? (double)(total_delta - idle_delta) * 100.0 / total_delta : 0;
     *out_mem = read_memory();
+    *out_net = read_network(s, elapsed);
+    *out_gpu = read_gpu(*out_mem);
+    *out_cpus = read_cpu_count();
 
     DIR *dir = opendir("/proc");
     if (!dir) return;
@@ -278,6 +603,9 @@ int main() {
     int count = 0;
     double cpu = 0;
     MemorySnapshot mem = {0};
+    NetworkSnapshot net = {"-", 0, 0};
+    GpuSnapshot gpu = {"GPU", 0, 0, 0, -1000.0, false, false, false};
+    int cpus = 1;
     bool needs_sample = true;
     bool needs_render = true;
 
@@ -285,11 +613,16 @@ int main() {
         struct timeval now;
         gettimeofday(&now, NULL);
 
+        static double cpu_temp = -1000.0;
+        static double cpu_freq = 0;
+
         // 1. Sampling (every 500ms)
         long long ms_since_sample = (now.tv_sec - last_sample.tv_sec) * 1000 + (now.tv_usec - last_sample.tv_usec) / 1000;
         if (ms_since_sample >= 500 || needs_sample) {
             if (procs) free(procs);
-            sample(sampler, sort, filter, &procs, &count, &cpu, &mem);
+            sample(sampler, sort, filter, &procs, &count, &cpu, &mem, &net, &gpu, &cpus);
+            cpu_temp = read_cpu_temp();
+            cpu_freq = read_cpu_freq();
             last_sample = now;
             needs_sample = false;
             needs_render = true;
@@ -301,8 +634,34 @@ int main() {
             struct winsize ws;
             ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws);
             printf("\x1B[H");
-            printf("utop (C version)\x1B[K\n");
-            printf("CPU: %5.1f%%    MEM: %5.1f%% %s / %s\x1B[K\n", cpu, (double)mem.used_bytes * 100.0 / mem.total_bytes, human_bytes(mem.used_bytes), human_bytes(mem.total_bytes));
+            printf("utop (C version)    CPUs: %d\x1B[K\n", cpus);
+            
+            char temp_str[32] = {0};
+            if (cpu_temp > -1000.0) sprintf(temp_str, " %.1f°C", cpu_temp);
+            char freq_str[32] = {0};
+            if (cpu_freq > 0) sprintf(freq_str, " @ %.2f GHz", cpu_freq / 1000.0);
+            
+            printf("CPU: %5.1f%%%s%s\x1B[K\n", cpu, freq_str, temp_str);
+            printf("MEM: %5.1f%% %s / %s\x1B[K\n", (double)mem.used_bytes * 100.0 / mem.total_bytes, human_bytes(mem.used_bytes), human_bytes(mem.total_bytes));
+            if (mem.swap_total_bytes > 0) {
+                printf("SWP: %5.1f%% %s / %s\x1B[K\n", (double)mem.swap_used_bytes * 100.0 / mem.swap_total_bytes, human_bytes(mem.swap_used_bytes), human_bytes(mem.swap_total_bytes));
+            } else {
+                printf("\x1B[K\n");
+            }
+            if (mem.cma_total_bytes > 0) {
+                printf("CMA: %5.1f%% %s / %s\x1B[K\n", (double)mem.cma_used_bytes * 100.0 / mem.cma_total_bytes, human_bytes(mem.cma_used_bytes), human_bytes(mem.cma_total_bytes));
+            }
+
+            if (gpu.has_usage) {
+                char g_temp[32] = {0}, g_vram[64] = {0};
+                if (gpu.has_temp) sprintf(g_temp, " %.1f°C", gpu.temp);
+                if (gpu.has_mem) sprintf(g_vram, "  VRAM: %5.1f%% %s / %s", (double)gpu.mem_used * 100.0 / gpu.mem_total, human_bytes(gpu.mem_used), human_bytes(gpu.mem_total));
+                printf("%s: %5.1f%%%s%s\x1B[K\n", gpu.name, gpu.usage, g_temp, g_vram);
+            } else {
+                printf("GPU: - %%\x1B[K\n");
+            }
+
+            printf("NET: %s  rx %s/s  tx %s/s\x1B[K\n", net.iface, human_bytes((unsigned long long)net.rx_rate), human_bytes((unsigned long long)net.tx_rate));
             printf("Controls: q:quit, j/k/arrows:move, h/l/arrows:sort, /:filter [%s]\x1B[K\n", is_search ? "SEARCHING" : "NORMAL");
             if (is_search) printf("Filter: /%s_\x1B[K\n", filter); 
             else if (filter[0]) printf("Filter: %s (press / to edit)\x1B[K\n", filter); 
@@ -321,7 +680,7 @@ int main() {
             for (int i = 0; i < (int)ws.ws_col && i < (pid_w + name_w + cpu_w + mem_w + thr_w + 4); i++) putchar('-');
             printf("\x1B[K\n");
 
-            int visible = ws.ws_row - 9;
+            int visible = ws.ws_row - 12; // Adjusted for new header lines
             if (selection >= count) selection = (count > 0) ? count - 1 : 0;
             if (selection < 0) selection = 0;
 
