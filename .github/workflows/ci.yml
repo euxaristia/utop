@@ -1,0 +1,36 @@
+name: C/C++ CI
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  build:
+    name: Build on Linux
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y clang make
+
+    - name: Build
+      run: |
+        make CC=clang CFLAGS="-Wall -Wextra -O3 -std=gnu11 -Werror"
+
+    - name: Check binary exists
+      run: |
+        test -x ./utop
+        file ./utop
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: utop-linux
+        path: utop
+        retention-days: 14
