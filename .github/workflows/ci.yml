@@ -21,7 +21,7 @@ jobs:
 
     - name: Run flawfinder
       run: |
-        flawfinder --minlevel=4 --error-level=4 src/
+        flawfinder --minlevel=3 --error-level=3 src/
 
     - name: Run cppcheck
       run: |
