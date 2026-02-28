@@ -17,7 +17,15 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y clang make
+        sudo apt-get install -y clang make flawfinder cppcheck
+
+    - name: Run flawfinder
+      run: |
+        flawfinder src/
+
+    - name: Run cppcheck
+      run: |
+        cppcheck --enable=all --suppress=missingIncludeSystem --error-exitcode=1 src/
 
     - name: Build
       run: |
