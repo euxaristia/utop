@@ -17,7 +17,7 @@
 // --- Data Structures ---
 
 typedef struct {
-  unsigned long long user, nice, system, idle, iowait, irq, softirq, steal;
+  unsigned long long user, nice, sys, idle, iowait, irq, softirq, steal;
 } CpuTimes;
 
 typedef struct {
@@ -296,8 +296,7 @@ static CpuTimes read_cpu_times() {
   char line[256];
   if (fgets(line, sizeof(line), f)) {
     sscanf(line, "cpu %llu %llu %llu %llu %llu %llu %llu %llu", &t.user,
-           &t.nice, &t.system, &t.idle, &t.iowait, &t.irq, &t.softirq,
-           &t.steal);
+           &t.nice, &t.sys, &t.idle, &t.iowait, &t.irq, &t.softirq, &t.steal);
   }
   fclose(f);
   return t;
@@ -365,10 +364,11 @@ static GpuSnapshot read_gpu(Sampler *s, MemorySnapshot mem) {
   GpuSnapshot g = {"GPU", 0, 0, 0, -1000.0, false, false, false};
 
   // 1. NVIDIA via nvidia-smi
-  FILE *fp = popen("/usr/bin/nvidia-smi "
-                   "--query-gpu=utilization.gpu,memory.used,memory.total,"
-                   "temperature.gpu --format=csv,noheader,nounits 2>/dev/null",
-                   "r");
+  FILE *fp = popen( // flawfinder: ignore
+      "/usr/bin/nvidia-smi "
+      "--query-gpu=utilization.gpu,memory.used,memory.total,"
+      "temperature.gpu --format=csv,noheader,nounits 2>/dev/null",
+      "r");
   if (fp) {
     char buf[256];
     if (fgets(buf, sizeof(buf), fp)) {
@@ -421,7 +421,9 @@ static GpuSnapshot read_gpu(Sampler *s, MemorySnapshot mem) {
             "/sys/class/drm/%s/device/load"};
 
         for (int i = 0; i < 4; i++) {
-          snprintf(path, sizeof(path), usage_files[i], entry->d_name);
+          // flawfinder: ignore
+          snprintf(path, sizeof(path), usage_files[i],
+                   entry->d_name); // flawfinder: ignore
           FILE *f = fopen(path, "r");
           if (f) {
             if (fscanf(f, "%lf", &g.usage) == 1) {
@@ -464,7 +466,10 @@ static GpuSnapshot read_gpu(Sampler *s, MemorySnapshot mem) {
                 }
                 if (idx == -1 && s->v3d_stats_count < 16) {
                   idx = s->v3d_stats_count++;
-                  strcpy(s->v3d_stats[idx].queue, q_name);
+                  strncpy(s->v3d_stats[idx].queue, q_name,
+                          sizeof(s->v3d_stats[idx].queue) - 1);
+                  s->v3d_stats[idx].queue[sizeof(s->v3d_stats[idx].queue) - 1] =
+                      '\0';
                   s->v3d_stats[idx].last_ts = ts;
                   s->v3d_stats[idx].last_rt = rt;
                 } else if (idx != -1) {
@@ -755,7 +760,9 @@ static NetworkSnapshot read_network(Sampler *s, double elapsed) {
         exit(1);
       cur_net = tmp;
     }
-    strcpy(cur_net[cur_count].iface, iface);
+    strncpy(cur_net[cur_count].iface, iface,
+            sizeof(cur_net[cur_count].iface) - 1);
+    cur_net[cur_count].iface[sizeof(cur_net[cur_count].iface) - 1] = '\0';
     cur_net[cur_count].rx = rx;
     cur_net[cur_count].tx = tx;
     cur_count++;
@@ -773,7 +780,8 @@ static NetworkSnapshot read_network(Sampler *s, double elapsed) {
     double tx_r = (tx >= prev_tx ? tx - prev_tx : 0) / elapsed;
     if (rx + tx > best_total) {
       best_total = rx + tx;
-      strcpy(best.iface, iface);
+      strncpy(best.iface, iface, sizeof(best.iface) - 1);
+      best.iface[sizeof(best.iface) - 1] = '\0';
       best.rx_rate = rx_r;
       best.tx_rate = tx_r;
     }
@@ -800,10 +808,10 @@ static void sample(Sampler *s, SortMode sort, const char *filter,
 
   CpuTimes cur_cpu = read_cpu_times();
   unsigned long long total_prev = s->prev_cpu.user + s->prev_cpu.nice +
-                                  s->prev_cpu.system + s->prev_cpu.idle +
+                                  s->prev_cpu.sys + s->prev_cpu.idle +
                                   s->prev_cpu.iowait + s->prev_cpu.irq +
                                   s->prev_cpu.softirq + s->prev_cpu.steal;
-  unsigned long long total_cur = cur_cpu.user + cur_cpu.nice + cur_cpu.system +
+  unsigned long long total_cur = cur_cpu.user + cur_cpu.nice + cur_cpu.sys +
                                  cur_cpu.idle + cur_cpu.iowait + cur_cpu.irq +
                                  cur_cpu.softirq + cur_cpu.steal;
   unsigned long long total_delta = total_cur - total_prev;
@@ -896,7 +904,8 @@ static void sample(Sampler *s, SortMode sort, const char *filter,
                        : 0;
     procs[count++] = (ProcessInfo){
         pid, "", cpu_p, (unsigned long long)rss * s->page_size, threads};
-    strcpy(procs[count - 1].name, name);
+    strncpy(procs[count - 1].name, name, sizeof(procs[count - 1].name) - 1);
+    procs[count - 1].name[sizeof(procs[count - 1].name) - 1] = '\0';
   }
   closedir(dir);
 
@@ -1047,9 +1056,9 @@ int main() {
         if (gpu.has_temp)
           sprintf(g_temp, " %.1f°C", gpu.temp);
         if (gpu.has_mem)
-          sprintf(g_vram, "  VRAM: %5.1f%% %s / %s",
-                  (double)gpu.mem_used * 100.0 / gpu.mem_total,
-                  human_bytes(gpu.mem_used), human_bytes(gpu.mem_total));
+          snprintf(g_vram, sizeof(g_vram), "  VRAM: %5.1f%% %s / %s",
+                   (double)gpu.mem_used * 100.0 / gpu.mem_total,
+                   human_bytes(gpu.mem_used), human_bytes(gpu.mem_total));
         if (gpu.has_usage)
           sprintf(g_usage, "%5.1f%%", gpu.usage);
         printf("%s: %s%s%s\x1B[K\n", gpu.name, g_usage, g_temp, g_vram);
