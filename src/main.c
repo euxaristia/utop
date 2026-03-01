@@ -1044,13 +1044,6 @@ int main() {
       } else {
         printf("\x1B[K\n");
       }
-      if (mem.cma_total_bytes > 0) {
-        printf("CMA: %5.1f%% %s / %s\x1B[K\n",
-               (double)mem.cma_used_bytes * 100.0 / mem.cma_total_bytes,
-               human_bytes(mem.cma_used_bytes),
-               human_bytes(mem.cma_total_bytes));
-      }
-
       if (gpu.has_usage || gpu.has_mem) {
         char g_temp[32] = {0}, g_vram[64] = {0}, g_usage[32] = {0};
         if (gpu.has_temp)
@@ -1064,6 +1057,14 @@ int main() {
         printf("%s: %s%s%s\x1B[K\n", gpu.name, g_usage, g_temp, g_vram);
       } else {
         printf("GPU:\x1B[K\n");
+      }
+
+      if (mem.cma_total_bytes > 0 &&
+          (!gpu.has_mem || mem.cma_total_bytes != gpu.mem_total)) {
+        printf("CMA: %5.1f%% %s / %s\x1B[K\n",
+               (double)mem.cma_used_bytes * 100.0 / mem.cma_total_bytes,
+               human_bytes(mem.cma_used_bytes),
+               human_bytes(mem.cma_total_bytes));
       }
 
       printf("NET: %s  rx %s/s  tx %s/s\x1B[K\n", net.iface,
