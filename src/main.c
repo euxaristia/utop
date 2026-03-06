@@ -1143,7 +1143,12 @@ int main() {
           return 0;
         }
         if (is_search) {
-          if (k.type == K_ESC || k.type == K_ENTER) {
+          if (k.type == K_ESC) {
+            is_search = false;
+            filter[0] = 0;
+            needs_sample = true;
+            needs_render = true;
+          } else if (k.type == K_ENTER) {
             is_search = false;
             needs_render = true;
           } else if (k.type == K_BACKSPACE) {
