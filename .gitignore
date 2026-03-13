@@ -4,3 +4,10 @@ Cargo.lock
 .swiftpm/
 swift_output.txt
 utop
+
+
+# Added by cargo
+#
+# already existing elements were commented out
+
+#/target

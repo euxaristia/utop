@@ -1,0 +1,25 @@
+Script started on 2026-03-13 14:49:30-04:00 [COMMAND="./tests/utop_c" <not executed on terminal>]
+[?1049h[2J[H[?25l[Hutop (C version)    CPUs: 20[K
+CPU:   3.7% @ 4.12 GHz 63.0°C[K
+MEM:  27.7% 8.55 GiB / 30.86 GiB[K
+SWP:   4.1% 1.28 GiB / 30.86 GiB[K
+NVIDIA GPU:   1.0% 49.0°C  VRAM:  10.1% 1.21 GiB / 11.94 GiB[K
+NET: wlan0  rx 0 B/s  tx 0 B/s[K
+Controls: q:quit, j/k/arrows:move, h/l/arrows:sort, /:filter [NORMAL][K
+[K
+[K
+PID     NAME            CPU%▼          MEM  THR[K
+[K
+[J[0;1HShowing 7--6 of 581[K[Hutop (C version)    CPUs: 20[K
+CPU:  35.4% @ 4.36 GHz 62.0°C[K
+MEM:  27.7% 8.54 GiB / 30.86 GiB[K
+SWP:   4.1% 1.28 GiB / 30.86 GiB[K
+NVIDIA GPU:   1.0% 49.0°C  VRAM:  10.1% 1.21 GiB / 11.94 GiB[K
+NET: wlan0  rx 0 B/s  tx 0 B/s[K
+Controls: q:quit, j/k/arrows:move, h/l/arrows:sort, /:filter [NORMAL][K
+[K
+[K
+PID     NAME            CPU%▼          MEM  THR[K
+[K
+[J[0;1HShowing 7--6 of 581[K
+Script done on 2026-03-13 14:49:33-04:00 [COMMAND_EXIT_CODE="0"]

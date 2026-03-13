@@ -1,23 +1,19 @@
-CC = clang
-CFLAGS = -Wall -Wextra -O3 -std=gnu11
-LDFLAGS = 
-
-TARGET = utop
+TARGET = target/release/utop
 PREFIX ?= $(HOME)/.local
 BINDIR = $(PREFIX)/bin
 
 all: $(TARGET)
 
-$(TARGET): src/main.c
-	$(CC) $(CFLAGS) src/main.c -o $(TARGET) $(LDFLAGS)
+$(TARGET): src/main.rs
+	cargo build --release
 
 install: $(TARGET)
 	mkdir -p $(BINDIR)
-	cp $(TARGET) $(BINDIR)/$(TARGET)
-	chmod 755 $(BINDIR)/$(TARGET)
+	cp $(TARGET) $(BINDIR)/utop
+	chmod 755 $(BINDIR)/utop
 
 uninstall:
-	rm -f $(BINDIR)/$(TARGET)
+	rm -f $(BINDIR)/utop
 
 clean:
-	rm -f $(TARGET)
+	cargo clean

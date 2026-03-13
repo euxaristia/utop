@@ -1,6 +1,6 @@
 # utop
 
-`utop` is a high-performance terminal system monitor for Linux, written in pure C.
+`utop` is a high-performance terminal system monitor for Linux, now rewritten in pure Rust.
 
 - Zero-allocation process sampling for maximum speed.
 - No third-party TUI libraries (uses ANSI escape sequences).
@@ -17,19 +17,23 @@
 ## Requirements
 
 - Linux
-- A C compiler (Clang recommended)
-- Make
+- Rust & Cargo
+- Make (optional)
 
 ## Build
 
 ```bash
+cargo build --release
+# or just:
 make
 ```
 
 ## Run
 
 ```bash
-./utop
+./target/release/utop
+# or if installed:
+utop
 ```
 
 ## Controls
