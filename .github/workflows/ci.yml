@@ -1,4 +1,4 @@
-name: C/C++ CI
+name: Rust CI
 
 on:
   push:
@@ -14,31 +14,32 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    - name: Install dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y clang make flawfinder cppcheck
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
 
-    - name: Run flawfinder
-      run: |
-        flawfinder --minlevel=3 --error-level=3 src/
-
-    - name: Run cppcheck
-      run: |
-        cppcheck --enable=all --suppress=missingIncludeSystem --error-exitcode=1 src/
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Build
-      run: |
-        make CC=clang CFLAGS="-Wall -Wextra -O3 -std=gnu11 -Werror"
+      run: cargo build --release
+
+    - name: Run tests
+      run: cargo test
 
     - name: Check binary exists
       run: |
-        test -x ./utop
-        file ./utop
+        test -x ./target/release/utop
+        file ./target/release/utop
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
         name: utop-linux
-        path: utop
+        path: target/release/utop
         retention-days: 14
