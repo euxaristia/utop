@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::cmp::Ordering;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Write};
@@ -57,12 +58,6 @@ struct NetworkSnapshot {
     tx_rate: f64,
 }
 
-#[derive(Default, Clone)]
-struct NetStats {
-    iface: String,
-    rx: u64, tx: u64,
-}
-
 struct Terminal {
     original_termios: libc::termios,
 }
@@ -107,12 +102,6 @@ extern "C" fn signal_handler(_sig: libc::c_int) {
     unsafe { QUIT = true; }
 }
 
-#[derive(Default)]
-struct PidTicks {
-    ticks: u64,
-    pid: i32,
-}
-
 #[derive(Default, Clone)]
 struct V3dStats {
     queue: String,
@@ -122,28 +111,30 @@ struct V3dStats {
 
 struct Sampler {
     prev_cpu: CpuTimes,
-    prev_ticks: Vec<PidTicks>,
-    prev_net: Vec<NetStats>,
+    prev_ticks: HashMap<i32, u64>,
+    prev_net: HashMap<String, (u64, u64)>,
     last_sample: Instant,
     page_size: i64,
     v3d_stats: Vec<V3dStats>,
     cpu_count: i32,
     procs: Vec<ProcessInfo>,
-    cur_ticks: Vec<PidTicks>,
+    cpu_temp_path: Option<String>,
+    cpu_freq_paths: Vec<String>,
 }
 
 impl Sampler {
     fn new() -> Self {
         Self {
             prev_cpu: CpuTimes::default(),
-            prev_ticks: Vec::new(),
-            prev_net: Vec::new(),
+            prev_ticks: HashMap::new(),
+            prev_net: HashMap::new(),
             last_sample: Instant::now(),
             page_size: unsafe { libc::sysconf(libc::_SC_PAGESIZE) },
             v3d_stats: Vec::new(),
             cpu_count: read_cpu_count(),
             procs: Vec::new(),
-            cur_ticks: Vec::new(),
+            cpu_temp_path: None,
+            cpu_freq_paths: Vec::new(),
         }
     }
 }
@@ -161,19 +152,29 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
-fn read_cpu_temp() -> f64 {
+fn read_cpu_temp(cached_path: &mut Option<String>) -> f64 {
+    if let Some(ref path) = *cached_path {
+        if let Ok(temp_str) = fs::read_to_string(path)
+            && let Ok(t) = temp_str.trim().parse::<f64>() {
+                return t / 1000.0;
+            }
+    }
+    // Discovery: scan once and cache the winning path
     if let Ok(entries) = fs::read_dir("/sys/class/thermal") {
         for entry in entries.flatten() {
             let name_str = entry.file_name().to_string_lossy().to_string();
             if name_str.starts_with("thermal_zone")
                 && let Ok(type_str) = fs::read_to_string(entry.path().join("type")) {
                     let type_lower = type_str.to_lowercase();
-                    if (type_lower.contains("pkg") || type_lower.contains("cpu") ||
-                       type_lower.contains("core") || type_lower.contains("soc"))
-                        && let Ok(temp_str) = fs::read_to_string(entry.path().join("temp"))
+                    if type_lower.contains("pkg") || type_lower.contains("cpu") ||
+                       type_lower.contains("core") || type_lower.contains("soc") {
+                        let temp_path = entry.path().join("temp");
+                        if let Ok(temp_str) = fs::read_to_string(&temp_path)
                             && let Ok(t) = temp_str.trim().parse::<f64>() {
+                                *cached_path = Some(temp_path.to_string_lossy().into_owned());
                                 return t / 1000.0;
                             }
+                    }
                 }
         }
     }
@@ -183,6 +184,7 @@ fn read_cpu_temp() -> f64 {
                 let name_lower = name_str.to_lowercase();
                 if name_lower.contains("coretemp") || name_lower.contains("cpu") || name_lower.contains("k10temp") {
                     let mut best = -1000.0;
+                    let mut best_path = String::new();
                     if let Ok(subentries) = fs::read_dir(entry.path()) {
                         for subentry in subentries.flatten() {
                             let sname_str = subentry.file_name().to_string_lossy().to_string();
@@ -190,11 +192,15 @@ fn read_cpu_temp() -> f64 {
                                 && let Ok(t_str) = fs::read_to_string(subentry.path())
                                     && let Ok(t) = t_str.trim().parse::<f64>() {
                                         let t_c = t / 1000.0;
-                                        if t_c > best { best = t_c; }
+                                        if t_c > best {
+                                            best = t_c;
+                                            best_path = subentry.path().to_string_lossy().into_owned();
+                                        }
                                     }
                         }
                     }
                     if best > -1000.0 {
+                        *cached_path = Some(best_path);
                         return best;
                     }
                 }
@@ -204,23 +210,33 @@ fn read_cpu_temp() -> f64 {
     -1000.0
 }
 
-fn read_cpu_freq() -> f64 {
-    // Try sysfs first — reads one small file per CPU, avoids loading all of /proc/cpuinfo
-    if let Ok(entries) = fs::read_dir("/sys/devices/system/cpu") {
+fn read_cpu_freq(cached_paths: &mut Vec<String>) -> f64 {
+    // Discover sysfs freq paths once and cache them
+    if cached_paths.is_empty() {
+        if let Ok(entries) = fs::read_dir("/sys/devices/system/cpu") {
+            for entry in entries.flatten() {
+                let name_str = entry.file_name().to_string_lossy().to_string();
+                if name_str.starts_with("cpu") && name_str.len() > 3
+                    && name_str.chars().nth(3).unwrap().is_ascii_digit() {
+                    let freq_path = entry.path().join("cpufreq/scaling_cur_freq");
+                    if fs::metadata(&freq_path).is_ok() {
+                        cached_paths.push(freq_path.to_string_lossy().into_owned());
+                    }
+                }
+            }
+        }
+    }
+    if !cached_paths.is_empty() {
         let mut total = 0.0;
         let mut count = 0;
-        for entry in entries.flatten() {
-            let name_str = entry.file_name().to_string_lossy().to_string();
-            if name_str.starts_with("cpu") && name_str.len() > 3 && name_str.chars().nth(3).unwrap().is_ascii_digit()
-                && let Ok(khz_str) = fs::read_to_string(entry.path().join("cpufreq/scaling_cur_freq"))
-                    && let Ok(khz) = khz_str.trim().parse::<f64>() {
-                        total += khz / 1000.0;
-                        count += 1;
-                    }
+        for path in cached_paths.iter() {
+            if let Ok(khz_str) = fs::read_to_string(path)
+                && let Ok(khz) = khz_str.trim().parse::<f64>() {
+                    total += khz / 1000.0;
+                    count += 1;
+                }
         }
-        if count > 0 {
-            return total / count as f64;
-        }
+        if count > 0 { return total / count as f64; }
     }
     // Fall back to /proc/cpuinfo
     if let Ok(content) = fs::read_to_string("/proc/cpuinfo") {
@@ -536,12 +552,12 @@ fn read_gpu(s: &mut Sampler, mem: &MemorySnapshot, cached_gpu: &mut GpuSnapshot,
     g
 }
 
-fn read_network(s: &mut Sampler, elapsed: f64) -> NetworkSnapshot {
+fn read_network(prev_net: &mut HashMap<String, (u64, u64)>, elapsed: f64) -> NetworkSnapshot {
     let mut best = NetworkSnapshot { iface: "-".to_string(), rx_rate: 0.0, tx_rate: 0.0 };
     if let Ok(content) = fs::read_to_string("/proc/net/dev") {
-        let mut cur_net = Vec::new();
+        let mut cur_net: HashMap<String, (u64, u64)> = HashMap::new();
         let mut best_total = 0;
-        
+
         for line in content.lines().skip(2) {
             let parts: Vec<&str> = line.split(':').collect();
             if parts.len() == 2 {
@@ -550,30 +566,20 @@ fn read_network(s: &mut Sampler, elapsed: f64) -> NetworkSnapshot {
                 let stats: Vec<&str> = parts[1].split_whitespace().collect();
                 if stats.len() >= 9
                     && let (Ok(rx), Ok(tx)) = (stats[0].parse::<u64>(), stats[8].parse::<u64>()) {
-                        cur_net.push(NetStats { iface: iface.clone(), rx, tx });
-                        
-                        let mut prev_rx = rx;
-                        let mut prev_tx = tx;
-                        for prev in &s.prev_net {
-                            if prev.iface == iface {
-                                prev_rx = prev.rx;
-                                prev_tx = prev.tx;
-                                break;
-                            }
-                        }
-                        
+                        let (prev_rx, prev_tx) = prev_net.get(&iface).copied().unwrap_or((rx, tx));
                         let rx_r = if rx >= prev_rx { (rx - prev_rx) as f64 / elapsed } else { 0.0 };
                         let tx_r = if tx >= prev_tx { (tx - prev_tx) as f64 / elapsed } else { 0.0 };
                         if rx + tx > best_total {
                             best_total = rx + tx;
-                            best.iface = iface;
+                            best.iface = iface.clone();
                             best.rx_rate = rx_r;
                             best.tx_rate = tx_r;
                         }
+                        cur_net.insert(iface, (rx, tx));
                     }
             }
         }
-        s.prev_net = cur_net;
+        *prev_net = cur_net;
     }
     best
 }
@@ -596,17 +602,18 @@ fn sample(
 
     *out_cpu = if total_delta > 0 { (total_delta - idle_delta) as f64 * 100.0 / total_delta as f64 } else { 0.0 };
     *out_mem = read_memory();
-    *out_net = read_network(s, elapsed);
+    *out_net = read_network(&mut s.prev_net, elapsed);
     *out_gpu = read_gpu(s, out_mem, cached_gpu, last_gpu_read);
     *out_cpus = s.cpu_count;
 
     s.procs.clear();
-    s.cur_ticks.clear();
+    let mut new_ticks: HashMap<i32, u64> = HashMap::with_capacity(s.prev_ticks.len());
     let filter_lower = filter.to_lowercase();
 
     if let Ok(entries) = fs::read_dir("/proc") {
         for entry in entries.flatten() {
-            let name_str = entry.file_name().to_string_lossy().to_string();
+            let fname = entry.file_name();
+            let name_str = fname.to_string_lossy();
             if name_str.chars().next().unwrap_or('a').is_ascii_digit()
                 && let Ok(pid) = name_str.parse::<i32>() {
                     let stat_path = entry.path().join("stat");
@@ -617,13 +624,14 @@ fn sample(
                             if let Some(p) = s_str.find('(')
                                 && let Some(endp) = s_str.rfind(')') {
                                     let proc_name = s_str[p + 1..endp].to_string();
-                                    let pid_str = pid.to_string();
-                                    
-                                    if !filter.is_empty()
-                                        && !proc_name.to_lowercase().contains(&filter_lower) && !pid_str.contains(&filter_lower) {
+
+                                    if !filter.is_empty() {
+                                        let pid_str = pid.to_string();
+                                        if !proc_name.to_lowercase().contains(&filter_lower) && !pid_str.contains(&filter_lower) {
                                             continue;
                                         }
-                                    
+                                    }
+
                                     let after_paren = &s_str[endp + 2..];
                                     let parts: Vec<&str> = after_paren.split_whitespace().collect();
                                     if parts.len() >= 22
@@ -632,18 +640,11 @@ fn sample(
                                             parts[17].parse::<i32>(), parts[21].parse::<i64>()
                                         ) {
                                             let total_ticks = utime + stime;
-                                            s.cur_ticks.push(PidTicks { ticks: total_ticks, pid });
-
-                                            let mut prev_t = 0;
-                                            for pt in &s.prev_ticks {
-                                                if pt.pid == pid {
-                                                    prev_t = pt.ticks;
-                                                    break;
-                                                }
-                                            }
+                                            let prev_t = s.prev_ticks.get(&pid).copied().unwrap_or(0);
+                                            new_ticks.insert(pid, total_ticks);
 
                                             let cpu_p = if total_delta > 0 {
-                                                (total_ticks.saturating_sub(prev_t)) as f64 * 100.0 / total_delta as f64
+                                                total_ticks.saturating_sub(prev_t) as f64 * 100.0 / total_delta as f64
                                             } else { 0.0 };
 
                                             s.procs.push(ProcessInfo {
@@ -661,7 +662,7 @@ fn sample(
         }
     }
 
-    std::mem::swap(&mut s.prev_ticks, &mut s.cur_ticks);
+    s.prev_ticks = new_ticks;
     s.prev_cpu = cur_cpu;
 
     s.procs.sort_by(|a, b| {
@@ -738,8 +739,8 @@ fn main() {
 
         if now.duration_since(last_sample) >= Duration::from_millis(500) || needs_sample {
             sample(&mut sampler, sort, &filter, &mut cpu, &mut mem, &mut net, &mut gpu, &mut cpus, &mut cached_gpu, &mut last_gpu_read);
-            cpu_temp = read_cpu_temp();
-            cpu_freq = read_cpu_freq();
+            cpu_temp = read_cpu_temp(&mut sampler.cpu_temp_path);
+            cpu_freq = read_cpu_freq(&mut sampler.cpu_freq_paths);
             last_sample = now;
             needs_sample = false;
             needs_render = true;
