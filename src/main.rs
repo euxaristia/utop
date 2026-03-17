@@ -58,6 +58,14 @@ struct NetworkSnapshot {
     tx_rate: f64,
 }
 
+#[derive(Default, Clone)]
+struct StorageSnapshot {
+    mount_point: String,
+    device: String,
+    used_bytes: u64,
+    total_bytes: u64,
+}
+
 struct Terminal {
     original_termios: libc::termios,
 }
@@ -584,10 +592,59 @@ fn read_network(prev_net: &mut HashMap<String, (u64, u64)>, elapsed: f64) -> Net
     best
 }
 
+fn read_storage() -> Vec<StorageSnapshot> {
+    let mut snapshots = Vec::new();
+    if let Ok(content) = fs::read_to_string("/proc/mounts") {
+        for line in content.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 3 {
+                let device = parts[0];
+                let mount_point = parts[1];
+                let _fs_type = parts[2];
+
+                // Skip pseudo-filesystems, only want physical disks
+                if !device.starts_with("/dev/") { continue; }
+                
+                // Avoid duplicates (e.g. same partition mounted in multiple places)
+                if snapshots.iter().any(|s: &StorageSnapshot| s.mount_point == mount_point) { continue; }
+
+                let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+                if let Ok(c_mount_point) = std::ffi::CString::new(mount_point) {
+                    if unsafe { libc::statvfs(c_mount_point.as_ptr(), &mut stat) } == 0 {
+                        let frsize = if stat.f_frsize > 0 { stat.f_frsize as u64 } else { stat.f_bsize as u64 };
+                        let total = stat.f_blocks as u64 * frsize;
+                        let free = stat.f_bfree as u64 * frsize;
+                        let used = total.saturating_sub(free);
+                        
+                        if total > 0 {
+                            snapshots.push(StorageSnapshot {
+                                mount_point: mount_point.to_string(),
+                                device: device.to_string(),
+                                used_bytes: used,
+                                total_bytes: total,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Sort by total size (descending), ensuring / is always first
+    snapshots.sort_by(|a, b| {
+        if a.mount_point == "/" { std::cmp::Ordering::Less }
+        else if b.mount_point == "/" { std::cmp::Ordering::Greater }
+        else {
+            b.total_bytes.cmp(&a.total_bytes)
+                .then_with(|| a.mount_point.cmp(&b.mount_point))
+        }
+    });
+    snapshots
+}
+
 fn sample(
     s: &mut Sampler, sort: SortMode, filter: &str,
     out_cpu: &mut f64, out_mem: &mut MemorySnapshot, out_net: &mut NetworkSnapshot,
-    out_gpu: &mut GpuSnapshot, out_cpus: &mut i32, cached_gpu: &mut GpuSnapshot, last_gpu_read: &mut Instant
+    out_gpu: &mut GpuSnapshot, out_storage: &mut Vec<StorageSnapshot>, out_cpus: &mut i32, cached_gpu: &mut GpuSnapshot, last_gpu_read: &mut Instant
 ) {
     let now = Instant::now();
     let mut elapsed = now.duration_since(s.last_sample).as_secs_f64();
@@ -604,6 +661,7 @@ fn sample(
     *out_mem = read_memory();
     *out_net = read_network(&mut s.prev_net, elapsed);
     *out_gpu = read_gpu(s, out_mem, cached_gpu, last_gpu_read);
+    *out_storage = read_storage();
     *out_cpus = s.cpu_count;
 
     s.procs.clear();
@@ -724,6 +782,7 @@ fn main() {
     let mut mem = MemorySnapshot::default();
     let mut net = NetworkSnapshot::default();
     let mut gpu = GpuSnapshot::default();
+    let mut storage: Vec<StorageSnapshot> = Vec::new();
     let mut cached_gpu = GpuSnapshot::default();
     let mut last_gpu_read = Instant::now().checked_sub(Duration::from_secs(10)).unwrap();
     let mut cpus = 1;
@@ -738,7 +797,7 @@ fn main() {
         let now = Instant::now();
 
         if now.duration_since(last_sample) >= Duration::from_millis(500) || needs_sample {
-            sample(&mut sampler, sort, &filter, &mut cpu, &mut mem, &mut net, &mut gpu, &mut cpus, &mut cached_gpu, &mut last_gpu_read);
+            sample(&mut sampler, sort, &filter, &mut cpu, &mut mem, &mut net, &mut gpu, &mut storage, &mut cpus, &mut cached_gpu, &mut last_gpu_read);
             cpu_temp = read_cpu_temp(&mut sampler.cpu_temp_path);
             cpu_freq = read_cpu_freq(&mut sampler.cpu_freq_paths);
             last_sample = now;
@@ -785,6 +844,12 @@ fn main() {
             }
 
             let _ = writeln!(out, "NET: {}  rx {}/s  tx {}/s\x1B[K", net.iface, human_bytes(net.rx_rate as u64), human_bytes(net.tx_rate as u64));
+            
+            for s in storage.iter().take(3) {
+                let pct = if s.total_bytes > 0 { s.used_bytes as f64 * 100.0 / s.total_bytes as f64 } else { 0.0 };
+                let _ = writeln!(out, "DSK: {:<10} {:5.1}% {} / {} [{}]\x1B[K", s.mount_point, pct, human_bytes(s.used_bytes), human_bytes(s.total_bytes), s.device);
+            }
+
             let _ = writeln!(out, "Controls: q:quit, j/k/arrows:move, h/l/arrows:sort, /:filter [{}]\x1B[K", if is_search { "SEARCHING" } else { "NORMAL" });
 
             if is_search {
@@ -819,7 +884,11 @@ fn main() {
             for _ in 0..num_dashes { let _ = write!(out, "-"); }
             let _ = writeln!(out, "\x1B[K");
 
-            let visible = ws.ws_row.saturating_sub(12) as usize;
+            let mut header_lines = 11;
+            if mem.cma_total_bytes > 0 && (!gpu.has_mem || mem.cma_total_bytes != gpu.mem_total) { header_lines += 1; }
+            header_lines += storage.len().min(3);
+
+            let visible = ws.ws_row.saturating_sub(header_lines as u16 + 1) as usize;
             let count = sampler.procs.len();
             if selection >= count && count > 0 { selection = count - 1; }
             if count == 0 { selection = 0; }
@@ -927,5 +996,18 @@ fn main() {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_human_bytes() {
+        assert_eq!(human_bytes(100), "100 B");
+        assert_eq!(human_bytes(1024), "1.0 KiB");
+        assert_eq!(human_bytes(1024 * 1024), "1.0 MiB");
+        assert_eq!(human_bytes(1024 * 1024 * 1024), "1.00 GiB");
     }
 }
