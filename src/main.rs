@@ -124,7 +124,9 @@ struct Sampler {
     last_sample: Instant,
     page_size: i64,
     v3d_stats: Vec<V3dStats>,
-    cpu_count: i32,
+    cpu_count: String,
+    cpu_name: String,
+    gpu_cores: String,
     procs: Vec<ProcessInfo>,
     cpu_temp_path: Option<String>,
     cpu_freq_paths: Vec<String>,
@@ -140,6 +142,8 @@ impl Sampler {
             page_size: unsafe { libc::sysconf(libc::_SC_PAGESIZE) },
             v3d_stats: Vec::new(),
             cpu_count: read_cpu_count(),
+            cpu_name: read_cpu_name(),
+            gpu_cores: read_gpu_cores(),
             procs: Vec::new(),
             cpu_temp_path: None,
             cpu_freq_paths: Vec::new(),
@@ -265,6 +269,67 @@ fn read_cpu_freq(cached_paths: &mut Vec<String>) -> f64 {
     0.0
 }
 
+fn read_gpu_cores() -> String {
+    // Try NVIDIA
+    if let Ok(output) = std::process::Command::new("/usr/bin/nvidia-settings")
+        .args(["-q", "CUDACores", "-t"])
+        .output()
+    {
+        if output.status.success() {
+            let out_str = String::from_utf8_lossy(&output.stdout);
+            if let Ok(cores) = out_str.trim().parse::<u32>() {
+                return format!("{} CUDA Cores", cores);
+            }
+        }
+    }
+
+    // Try AMD
+    if let Ok(entries) = fs::read_dir("/sys/class/kfd/kfd/topology/nodes/") {
+        let mut max_simd = 0;
+        for entry in entries.flatten() {
+            if let Ok(content) = fs::read_to_string(entry.path().join("properties")) {
+                for line in content.lines() {
+                    if line.starts_with("simd_count") {
+                        let parts: Vec<&str> = line.split_whitespace().collect();
+                        if parts.len() >= 2 {
+                            if let Ok(simd) = parts[1].parse::<u32>() {
+                                if simd > max_simd {
+                                    max_simd = simd;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if max_simd > 0 {
+            let sps = max_simd * 64;
+            return format!("{} Stream Processors", sps);
+        }
+    }
+
+    String::new()
+}
+
+fn read_cpu_name() -> String {
+    if let Ok(content) = fs::read_to_string("/proc/cpuinfo") {
+        for line in content.lines() {
+            if line.starts_with("model name") {
+                if let Some(name) = line.split(':').nth(1) {
+                    let mut n = name.trim().replace("(R)", "").replace("(TM)", "").replace("(tm)", "").replace("(r)", "");
+                    n = n.replace(" CPU", "").replace(" Processor", "");
+                    let parts: Vec<&str> = n.split_whitespace().collect();
+                    n = parts.join(" ");
+                    n = n.replace("Intel Core ", "");
+                    n = n.replace("AMD Ryzen ", "Ryzen ");
+                    return n;
+                }
+            }
+        }
+    }
+    "CPU".to_string()
+}
+
 fn read_cpu_times() -> CpuTimes {
     let mut t = CpuTimes::default();
     if let Ok(content) = fs::read_to_string("/proc/stat")
@@ -319,16 +384,41 @@ fn read_memory() -> MemorySnapshot {
     m
 }
 
-fn read_cpu_count() -> i32 {
-    let mut count = 0;
-    if let Ok(content) = fs::read_to_string("/proc/stat") {
+fn read_cpu_count() -> String {
+    let mut cores = 0;
+    let mut physical_ids = std::collections::HashSet::new();
+
+    if let Ok(content) = fs::read_to_string("/proc/cpuinfo") {
         for line in content.lines() {
-            if line.starts_with("cpu") && line.len() > 3 && line.chars().nth(3).unwrap().is_ascii_digit() {
-                count += 1;
+            if line.starts_with("processor") {
+                cores += 1;
+            } else if line.starts_with("physical id") {
+                if let Some(id_str) = line.split(':').nth(1) {
+                    if let Ok(id) = id_str.trim().parse::<u32>() {
+                        physical_ids.insert(id);
+                    }
+                }
             }
         }
     }
-    if count > 0 { count } else { 1 }
+
+    if cores == 0 {
+        if let Ok(content) = fs::read_to_string("/proc/stat") {
+            for line in content.lines() {
+                if line.starts_with("cpu") && line.len() > 3 && line.chars().nth(3).unwrap().is_ascii_digit() {
+                    cores += 1;
+                }
+            }
+        }
+    }
+    if cores == 0 { cores = 1; }
+
+    let sockets = if physical_ids.is_empty() { 1 } else { physical_ids.len() };
+
+    let cpu_str = if sockets == 1 { "CPU" } else { "CPUs" };
+    let core_str = if cores == 1 { "core" } else { "cores" };
+
+    format!("{} {} {} {}", sockets, cpu_str, cores, core_str)
 }
 
 fn read_gpu(s: &mut Sampler, mem: &MemorySnapshot, cached_gpu: &mut GpuSnapshot, last_gpu_read: &mut Instant) -> GpuSnapshot {
@@ -342,21 +432,21 @@ fn read_gpu(s: &mut Sampler, mem: &MemorySnapshot, cached_gpu: &mut GpuSnapshot,
 
     // 1. NVIDIA via nvidia-smi
     if let Ok(output) = std::process::Command::new("/usr/bin/nvidia-smi")
-        .args(["--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu", "--format=csv,noheader,nounits"])
+        .args(["--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu", "--format=csv,noheader,nounits"])
         .output()
         && output.status.success() {
             let out_str = String::from_utf8_lossy(&output.stdout);
             if let Some(line) = out_str.lines().next() {
                 let parts: Vec<&str> = line.split(',').map(|p| p.trim()).collect();
-                if parts.len() >= 4 {
-                    g.usage = parts[0].parse().unwrap_or(0.0);
+                if parts.len() >= 5 {
+                    g.name = parts[0].to_string().replace("NVIDIA GeForce ", "").replace("NVIDIA ", "");
+                    g.usage = parts[1].parse().unwrap_or(0.0);
                     g.has_usage = true;
-                    g.mem_used = parts[1].parse::<u64>().unwrap_or(0) * 1024 * 1024;
+                    g.mem_used = parts[2].parse::<u64>().unwrap_or(0) * 1024 * 1024;
                     g.has_mem = true;
-                    g.mem_total = parts[2].parse::<u64>().unwrap_or(0) * 1024 * 1024;
-                    g.temp = parts[3].parse().unwrap_or(-1000.0);
+                    g.mem_total = parts[3].parse::<u64>().unwrap_or(0) * 1024 * 1024;
+                    g.temp = parts[4].parse().unwrap_or(-1000.0);
                     g.has_temp = true;
-                    g.name = "NVIDIA GPU".to_string();
                     *cached_gpu = g.clone();
                     return g;
                 }
@@ -644,7 +734,7 @@ fn read_storage() -> Vec<StorageSnapshot> {
 fn sample(
     s: &mut Sampler, sort: SortMode, filter: &str,
     out_cpu: &mut f64, out_mem: &mut MemorySnapshot, out_net: &mut NetworkSnapshot,
-    out_gpu: &mut GpuSnapshot, out_storage: &mut Vec<StorageSnapshot>, out_cpus: &mut i32, cached_gpu: &mut GpuSnapshot, last_gpu_read: &mut Instant
+    out_gpu: &mut GpuSnapshot, out_storage: &mut Vec<StorageSnapshot>, out_cpus: &mut String, cached_gpu: &mut GpuSnapshot, last_gpu_read: &mut Instant
 ) {
     let now = Instant::now();
     let mut elapsed = now.duration_since(s.last_sample).as_secs_f64();
@@ -662,7 +752,7 @@ fn sample(
     *out_net = read_network(&mut s.prev_net, elapsed);
     *out_gpu = read_gpu(s, out_mem, cached_gpu, last_gpu_read);
     *out_storage = read_storage();
-    *out_cpus = s.cpu_count;
+    *out_cpus = s.cpu_count.clone();
 
     s.procs.clear();
     let mut new_ticks: HashMap<i32, u64> = HashMap::with_capacity(s.prev_ticks.len());
@@ -785,7 +875,7 @@ fn main() {
     let mut storage: Vec<StorageSnapshot> = Vec::new();
     let mut cached_gpu = GpuSnapshot::default();
     let mut last_gpu_read = Instant::now().checked_sub(Duration::from_secs(10)).unwrap();
-    let mut cpus = 1;
+    let mut cpus = String::new();
     let mut needs_sample = true;
     let mut needs_render = true;
 
@@ -815,7 +905,7 @@ fn main() {
             let temp_str = if cpu_temp > -1000.0 { format!(" {:.1}°C", cpu_temp) } else { String::new() };
             let freq_str = if cpu_freq > 0.0 { format!(" @ {:.2} GHz", cpu_freq / 1000.0) } else { String::new() };
 
-            let _ = writeln!(out, "CPU: {:5.1}%{}{}\x1B[K", cpu, freq_str, temp_str);
+            let _ = writeln!(out, "{}: {:5.1}%{}{}\x1B[K", sampler.cpu_name, cpu, freq_str, temp_str);
             let mem_pct = if mem.total_bytes > 0 { mem.used_bytes as f64 * 100.0 / mem.total_bytes as f64 } else { 0.0 };
             let _ = writeln!(out, "MEM: {:5.1}% {} / {}\x1B[K", mem_pct, human_bytes(mem.used_bytes), human_bytes(mem.total_bytes));
 
