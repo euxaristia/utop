@@ -270,6 +270,30 @@ fn read_cpu_freq(cached_paths: &mut Vec<String>) -> f64 {
 }
 
 fn read_gpu_cores() -> String {
+    let mut gpu_count = 0;
+    
+    // Count GPUs via DRM
+    if let Ok(entries) = fs::read_dir("/sys/class/drm") {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("card") && !name.contains('-') {
+                gpu_count += 1;
+            }
+        }
+    }
+    // Fallback to nvidia-smi if DRM didn't find any
+    if gpu_count == 0 {
+        if let Ok(output) = std::process::Command::new("/usr/bin/nvidia-smi").arg("-L").output() {
+            if output.status.success() {
+                let out_str = String::from_utf8_lossy(&output.stdout);
+                gpu_count = out_str.lines().filter(|l| l.starts_with("GPU")).count();
+            }
+        }
+    }
+
+    let gpu_str = if gpu_count == 1 { "GPU:" } else { "GPUs:" };
+    let count_prefix = if gpu_count > 0 { format!("{} {}, ", gpu_str, gpu_count) } else { String::new() };
+
     // Try NVIDIA
     if let Ok(output) = std::process::Command::new("/usr/bin/nvidia-settings")
         .args(["-q", "CUDACores", "-t"])
@@ -278,7 +302,7 @@ fn read_gpu_cores() -> String {
         if output.status.success() {
             let out_str = String::from_utf8_lossy(&output.stdout);
             if let Ok(cores) = out_str.trim().parse::<u32>() {
-                return format!("{} CUDA Cores", cores);
+                return format!("{}{} CUDA Cores", count_prefix, cores);
             }
         }
     }
@@ -304,11 +328,15 @@ fn read_gpu_cores() -> String {
         }
         if max_simd > 0 {
             let sps = max_simd * 64;
-            return format!("{} Stream Processors", sps);
+            return format!("{}{} Stream Processors", count_prefix, sps);
         }
     }
 
-    String::new()
+    if gpu_count > 0 {
+        format!("{} {}", gpu_str, gpu_count)
+    } else {
+        String::new()
+    }
 }
 
 fn read_cpu_name() -> String {
@@ -415,10 +443,10 @@ fn read_cpu_count() -> String {
 
     let sockets = if physical_ids.is_empty() { 1 } else { physical_ids.len() };
 
-    let cpu_str = if sockets == 1 { "CPU" } else { "CPUs" };
+    let cpu_str = if sockets == 1 { "CPU:" } else { "CPUs:" };
     let core_str = if cores == 1 { "core" } else { "cores" };
 
-    format!("{} {} {} {}", sockets, cpu_str, cores, core_str)
+    format!("{} {}, {} {}", cpu_str, sockets, cores, core_str)
 }
 
 fn read_gpu(s: &mut Sampler, mem: &MemorySnapshot, cached_gpu: &mut GpuSnapshot, last_gpu_read: &mut Instant) -> GpuSnapshot {
@@ -900,7 +928,8 @@ fn main() {
             unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws); }
             
             let _ = write!(out, "\x1B[H");
-            let _ = writeln!(out, "utop (Rust version)    CPUs: {}\x1B[K", cpus);
+            let gpu_cores_str = if !sampler.gpu_cores.is_empty() { format!("    {}", sampler.gpu_cores) } else { String::new() };
+            let _ = writeln!(out, "utop (Rust version)    {}{}\x1B[K", cpus, gpu_cores_str);
 
             let temp_str = if cpu_temp > -1000.0 { format!(" {:.1}°C", cpu_temp) } else { String::new() };
             let freq_str = if cpu_freq > 0.0 { format!(" @ {:.2} GHz", cpu_freq / 1000.0) } else { String::new() };
