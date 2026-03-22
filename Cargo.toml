@@ -2,6 +2,7 @@
 name = "utop"
 version = "0.1.0"
 edition = "2024"
+license = "Unlicense"
 
 [dependencies]
 libc = "0.2.183"

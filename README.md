@@ -46,4 +46,4 @@ utop
 
 ## License
 
-Licensed under [GNU GPL v3.0](LICENSE).
+Licensed under [UNLICENSE](LICENSE).
