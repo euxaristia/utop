@@ -270,17 +270,42 @@ fn read_cpu_freq(cached_paths: &mut Vec<String>) -> f64 {
 }
 
 fn read_gpu_cores() -> String {
+    use std::collections::HashSet;
     let mut gpu_count = 0;
+    let mut unique_devices: HashSet<String> = HashSet::new();
+    let mut has_videocore = false;
     
-    // Count GPUs via DRM
+    // Count physical GPUs via DRM, deduplicating by device path
     if let Ok(entries) = fs::read_dir("/sys/class/drm") {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
             if name.starts_with("card") && !name.contains('-') {
-                gpu_count += 1;
+                let dev_id = fs::canonicalize(format!("/sys/class/drm/{}/device", name))
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| name.clone());
+                
+                // VideoCore/Broadcom GPUs (Pi4, etc.) expose multiple DRM
+                // drivers (vc4 display + v3d render) for one physical GPU
+                let is_videocore =
+                    fs::read_to_string(format!("/sys/class/drm/{}/device/uevent", name))
+                        .map(|u| u.contains("DRIVER=v3d") || u.contains("DRIVER=vc4"))
+                        .unwrap_or(false)
+                    || fs::read_to_string(format!("/sys/class/drm/{}/device/vendor", name))
+                        .map(|v| v.contains("0x14e4"))
+                        .unwrap_or(false);
+                
+                if is_videocore {
+                    has_videocore = true;
+                } else if unique_devices.insert(dev_id) {
+                    gpu_count += 1;
+                }
             }
         }
     }
+    if has_videocore {
+        gpu_count += 1;
+    }
+    
     // Fallback to nvidia-smi if DRM didn't find any
     if gpu_count == 0 {
         if let Ok(output) = std::process::Command::new("/usr/bin/nvidia-smi").arg("-L").output() {
