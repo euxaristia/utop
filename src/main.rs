@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::cmp::Ordering;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Write};
@@ -270,7 +270,6 @@ fn read_cpu_freq(cached_paths: &mut Vec<String>) -> f64 {
 }
 
 fn read_gpu_cores() -> String {
-    use std::collections::HashSet;
     let mut gpu_count = 0;
     let mut unique_devices: HashSet<String> = HashSet::new();
     let mut has_videocore = false;
@@ -280,19 +279,18 @@ fn read_gpu_cores() -> String {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
             if name.starts_with("card") && !name.contains('-') {
-                let dev_id = fs::canonicalize(format!("/sys/class/drm/{}/device", name))
+                let dev_path = format!("/sys/class/drm/{}/device", name);
+                let dev_id = fs::canonicalize(&dev_path)
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_else(|_| name.clone());
                 
                 // VideoCore/Broadcom GPUs (Pi4, etc.) expose multiple DRM
                 // drivers (vc4 display + v3d render) for one physical GPU
                 let is_videocore =
-                    fs::read_to_string(format!("/sys/class/drm/{}/device/uevent", name))
-                        .map(|u| u.contains("DRIVER=v3d") || u.contains("DRIVER=vc4"))
-                        .unwrap_or(false)
-                    || fs::read_to_string(format!("/sys/class/drm/{}/device/vendor", name))
-                        .map(|v| v.contains("0x14e4"))
-                        .unwrap_or(false);
+                    fs::read_to_string(format!("{}/uevent", dev_path))
+                        .is_ok_and(|u| u.contains("DRIVER=v3d") || u.contains("DRIVER=vc4"))
+                    || fs::read_to_string(format!("{}/vendor", dev_path))
+                        .is_ok_and(|v| v.contains("0x14e4"));
                 
                 if is_videocore {
                     has_videocore = true;
