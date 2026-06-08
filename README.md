@@ -1,10 +1,10 @@
 # utop
 
-`utop` is a high-performance terminal system monitor for Linux, now rewritten in pure Rust.
+`utop` is a high-performance terminal system monitor for Linux and macOS, now rewritten in pure Rust.
 
 - Zero-allocation process sampling for maximum speed.
 - No third-party TUI libraries (uses ANSI escape sequences).
-- Data source is Linux `/proc` and `/sys`.
+- Data sources are Linux `/proc` and `/sys`, and native macOS sysctl/Mach/libproc APIs.
 
 ## Features
 
@@ -16,7 +16,7 @@
 
 ## Requirements
 
-- Linux
+- Linux or macOS
 - Rust & Cargo
 - Make (optional)
 
