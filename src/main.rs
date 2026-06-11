@@ -186,8 +186,7 @@ fn human_bytes(bytes: u64) -> String {
 }
 
 fn clip_to_width(line: &str, width: usize) -> String {
-    let max_chars = width.saturating_sub(1);
-    line.chars().take(max_chars).collect()
+    line.chars().take(width).collect()
 }
 
 fn draw_line<W: Write>(
@@ -1190,17 +1189,19 @@ fn sample(
 
     #[cfg(target_os = "macos")]
     {
-        let initial_count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
-        if initial_count > 0 {
-            let mut pids = vec![0_i32; initial_count as usize + 64];
+        let initial_bytes = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+        if initial_bytes > 0 {
+            let initial_count = initial_bytes as usize / std::mem::size_of::<i32>();
+            let mut pids = vec![0_i32; initial_count + 64];
             let bytes = (pids.len() * std::mem::size_of::<i32>()) as libc::c_int;
-            let actual_count = unsafe {
+            let actual_bytes = unsafe {
                 libc::proc_listallpids(pids.as_mut_ptr() as *mut libc::c_void, bytes)
             };
 
-            if actual_count > 0 {
+            if actual_bytes > 0 {
+                let actual_count = actual_bytes as usize / std::mem::size_of::<i32>();
                 let proc_cpu_denominator = elapsed * s.logical_cpus.max(1) as f64 * 1_000_000_000.0;
-                for pid in pids.into_iter().take(actual_count as usize).filter(|pid| *pid > 0) {
+                for pid in pids.into_iter().take(actual_count).filter(|pid| *pid > 0) {
                     let mut proc_name = String::new();
                     let mut got_name = false;
                     if let Some(name) = s.proc_names.get(&pid) {
@@ -1438,7 +1439,7 @@ fn main() {
             draw_next_line(&mut out, &mut row, term_height, term_width, false, format_args!("{:<pid_w$} {:<name_w$} {:>w1$} {:>w2$} {:>thr_w$}", "PID", "NAME", cpu_hdr, mem_hdr, "THR",
                 pid_w=pid_w, name_w=name_w, w1=w1, w2=w2, thr_w=thr_w));
 
-            let max_dashes = term_width.saturating_sub(1);
+            let max_dashes = term_width;
             let req_dashes = pid_w + name_w + cpu_w + mem_w + thr_w + 4;
             let num_dashes = max_dashes.min(req_dashes);
             draw_next_line(&mut out, &mut row, term_height, term_width, false, format_args!("{}", "-".repeat(num_dashes)));
