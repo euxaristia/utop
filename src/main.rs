@@ -1,7 +1,15 @@
-use std::collections::{HashMap, HashSet};
 use std::cmp::Ordering;
+use std::collections::HashMap;
+#[cfg(target_os = "linux")]
+use std::collections::HashSet;
+use std::fmt;
+#[cfg(target_os = "macos")]
+use std::ffi::{CStr, CString};
+#[cfg(target_os = "linux")]
 use std::fs::{self, File};
-use std::io::{self, BufWriter, Read, Write};
+use std::io::{self, BufWriter, Write};
+#[cfg(target_os = "linux")]
+use std::io::Read;
 use std::time::{Duration, Instant};
 
 #[derive(Default, Clone)]
@@ -85,7 +93,7 @@ impl Terminal {
             let flags = libc::fcntl(libc::STDIN_FILENO, libc::F_GETFL);
             libc::fcntl(libc::STDIN_FILENO, libc::F_SETFL, flags | libc::O_NONBLOCK);
 
-            print!("\x1B[?1049h\x1B[2J\x1B[H\x1B[?25l");
+            print!("\x1B[?1049h\x1B[?7l\x1B[2J\x1B[H\x1B[?25l");
             io::stdout().flush()?;
 
             Ok(Self { original_termios })
@@ -98,7 +106,7 @@ impl Drop for Terminal {
         unsafe {
             libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &self.original_termios);
         }
-        print!("\x1B[?1049l\x1B[?25h\x1B[0m");
+        print!("\x1B[?7h\x1B[?1049l\x1B[?25h\x1B[0m");
         let _ = io::stdout().flush();
     }
 }
@@ -110,6 +118,7 @@ extern "C" fn signal_handler(_sig: libc::c_int) {
     unsafe { QUIT = true; }
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Default, Clone)]
 struct V3dStats {
     queue: String,
@@ -122,7 +131,9 @@ struct Sampler {
     prev_ticks: HashMap<i32, u64>,
     prev_net: HashMap<String, (u64, u64)>,
     last_sample: Instant,
+    #[cfg(target_os = "linux")]
     page_size: i64,
+    #[cfg(target_os = "linux")]
     v3d_stats: Vec<V3dStats>,
     cpu_count: String,
     cpu_name: String,
@@ -130,6 +141,10 @@ struct Sampler {
     procs: Vec<ProcessInfo>,
     cpu_temp_path: Option<String>,
     cpu_freq_paths: Vec<String>,
+    #[cfg(target_os = "macos")]
+    logical_cpus: u64,
+    #[cfg(target_os = "macos")]
+    proc_names: HashMap<i32, String>,
 }
 
 impl Sampler {
@@ -139,7 +154,9 @@ impl Sampler {
             prev_ticks: HashMap::new(),
             prev_net: HashMap::new(),
             last_sample: Instant::now(),
+            #[cfg(target_os = "linux")]
             page_size: unsafe { libc::sysconf(libc::_SC_PAGESIZE) },
+            #[cfg(target_os = "linux")]
             v3d_stats: Vec::new(),
             cpu_count: read_cpu_count(),
             cpu_name: read_cpu_name(),
@@ -147,6 +164,10 @@ impl Sampler {
             procs: Vec::new(),
             cpu_temp_path: None,
             cpu_freq_paths: Vec::new(),
+            #[cfg(target_os = "macos")]
+            logical_cpus: read_logical_cpu_count(),
+            #[cfg(target_os = "macos")]
+            proc_names: HashMap::new(),
         }
     }
 }
@@ -164,6 +185,93 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
+fn clip_to_width(line: &str, width: usize) -> String {
+    line.chars().take(width).collect()
+}
+
+fn draw_line<W: Write>(
+    out: &mut W,
+    row: u16,
+    width: usize,
+    reverse: bool,
+    args: fmt::Arguments<'_>,
+) -> io::Result<()> {
+    let line = clip_to_width(&args.to_string(), width);
+    if reverse {
+        write!(out, "\x1B[{};1H\x1B[0m\x1B[7m{}\x1B[0m\x1B[K", row, line)
+    } else {
+        write!(out, "\x1B[{};1H\x1B[0m{}\x1B[K", row, line)
+    }
+}
+
+fn draw_next_line<W: Write>(
+    out: &mut W,
+    row: &mut u16,
+    height: u16,
+    width: usize,
+    reverse: bool,
+    args: fmt::Arguments<'_>,
+) {
+    if *row <= height {
+        let _ = draw_line(out, *row, width, reverse, args);
+    }
+    *row = (*row).saturating_add(1);
+}
+
+#[cfg(target_os = "macos")]
+fn sysctl_into<T>(name: &str, value: &mut T) -> bool {
+    let Ok(name) = CString::new(name) else { return false; };
+    let mut len = std::mem::size_of::<T>() as libc::size_t;
+    unsafe {
+        libc::sysctlbyname(name.as_ptr(), value as *mut T as *mut libc::c_void, &mut len, std::ptr::null_mut(), 0) == 0
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn mach_host_self() -> libc::host_t {
+    #[allow(deprecated)]
+    unsafe { libc::mach_host_self() }
+}
+
+#[cfg(target_os = "macos")]
+fn sysctl_i32(name: &str) -> Option<i32> {
+    let mut value = 0_i32;
+    sysctl_into(name, &mut value).then_some(value)
+}
+
+#[cfg(target_os = "macos")]
+fn sysctl_u64(name: &str) -> Option<u64> {
+    let mut value = 0_u64;
+    sysctl_into(name, &mut value).then_some(value)
+}
+
+#[cfg(target_os = "macos")]
+fn sysctl_string(name: &str) -> Option<String> {
+    let name = CString::new(name).ok()?;
+    unsafe {
+        let mut len = 0_usize;
+        if libc::sysctlbyname(name.as_ptr(), std::ptr::null_mut(), &mut len, std::ptr::null_mut(), 0) != 0 || len == 0 {
+            return None;
+        }
+        let mut buf = vec![0_u8; len];
+        if libc::sysctlbyname(name.as_ptr(), buf.as_mut_ptr() as *mut libc::c_void, &mut len, std::ptr::null_mut(), 0) != 0 {
+            return None;
+        }
+        while buf.last().copied() == Some(0) {
+            buf.pop();
+        }
+        String::from_utf8(buf).ok().filter(|s| !s.is_empty())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn c_char_array_to_string(buf: &[libc::c_char]) -> String {
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    let bytes: Vec<u8> = buf[..end].iter().map(|&c| c as u8).collect();
+    String::from_utf8_lossy(&bytes).trim().to_string()
+}
+
+#[cfg(target_os = "linux")]
 fn read_cpu_temp(cached_path: &mut Option<String>) -> f64 {
     if let Some(ref path) = *cached_path {
         if let Ok(temp_str) = fs::read_to_string(path)
@@ -222,6 +330,12 @@ fn read_cpu_temp(cached_path: &mut Option<String>) -> f64 {
     -1000.0
 }
 
+#[cfg(target_os = "macos")]
+fn read_cpu_temp(_cached_path: &mut Option<String>) -> f64 {
+    -1000.0
+}
+
+#[cfg(target_os = "linux")]
 fn read_cpu_freq(cached_paths: &mut Vec<String>) -> f64 {
     // Discover sysfs freq paths once and cache them
     if cached_paths.is_empty() {
@@ -269,6 +383,15 @@ fn read_cpu_freq(cached_paths: &mut Vec<String>) -> f64 {
     0.0
 }
 
+#[cfg(target_os = "macos")]
+fn read_cpu_freq(_cached_paths: &mut Vec<String>) -> f64 {
+    sysctl_u64("hw.cpufrequency")
+        .or_else(|| sysctl_u64("hw.cpufrequency_max"))
+        .map(|hz| hz as f64 / 1_000_000.0)
+        .unwrap_or(0.0)
+}
+
+#[cfg(target_os = "linux")]
 fn read_gpu_cores() -> String {
     let mut gpu_count = 0;
     let mut unique_devices: HashSet<String> = HashSet::new();
@@ -362,6 +485,12 @@ fn read_gpu_cores() -> String {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn read_gpu_cores() -> String {
+    String::new()
+}
+
+#[cfg(target_os = "linux")]
 fn read_cpu_name() -> String {
     if let Ok(content) = fs::read_to_string("/proc/cpuinfo") {
         for line in content.lines() {
@@ -381,6 +510,14 @@ fn read_cpu_name() -> String {
     "CPU".to_string()
 }
 
+#[cfg(target_os = "macos")]
+fn read_cpu_name() -> String {
+    sysctl_string("machdep.cpu.brand_string")
+        .or_else(|| sysctl_string("hw.model"))
+        .unwrap_or_else(|| "CPU".to_string())
+}
+
+#[cfg(target_os = "linux")]
 fn read_cpu_times() -> CpuTimes {
     let mut t = CpuTimes::default();
     if let Ok(content) = fs::read_to_string("/proc/stat")
@@ -400,6 +537,29 @@ fn read_cpu_times() -> CpuTimes {
     t
 }
 
+#[cfg(target_os = "macos")]
+fn read_cpu_times() -> CpuTimes {
+    let mut t = CpuTimes::default();
+    unsafe {
+        let mut info = std::mem::zeroed::<libc::host_cpu_load_info>();
+        let mut count = libc::HOST_CPU_LOAD_INFO_COUNT;
+        let kr = libc::host_statistics64(
+            mach_host_self(),
+            libc::HOST_CPU_LOAD_INFO,
+            &mut info as *mut _ as libc::host_info64_t,
+            &mut count,
+        );
+        if kr == libc::KERN_SUCCESS {
+            t.user = info.cpu_ticks[libc::CPU_STATE_USER as usize] as u64;
+            t.sys = info.cpu_ticks[libc::CPU_STATE_SYSTEM as usize] as u64;
+            t.idle = info.cpu_ticks[libc::CPU_STATE_IDLE as usize] as u64;
+            t.nice = info.cpu_ticks[libc::CPU_STATE_NICE as usize] as u64;
+        }
+    }
+    t
+}
+
+#[cfg(target_os = "linux")]
 fn read_memory() -> MemorySnapshot {
     let mut m = MemorySnapshot::default();
     if let Ok(content) = fs::read_to_string("/proc/meminfo") {
@@ -435,6 +595,40 @@ fn read_memory() -> MemorySnapshot {
     m
 }
 
+#[cfg(target_os = "macos")]
+fn read_memory() -> MemorySnapshot {
+    let mut m = MemorySnapshot::default();
+    m.total_bytes = sysctl_u64("hw.memsize").unwrap_or(0);
+
+    unsafe {
+        let mut stats = std::mem::zeroed::<libc::vm_statistics64>();
+        let mut count = libc::HOST_VM_INFO64_COUNT;
+        let kr = libc::host_statistics64(
+            mach_host_self(),
+            libc::HOST_VM_INFO64,
+            &mut stats as *mut _ as libc::host_info64_t,
+            &mut count,
+        );
+        if kr == libc::KERN_SUCCESS {
+            let page_size = libc::sysconf(libc::_SC_PAGESIZE).max(1) as u64;
+            let active = stats.active_count as u64;
+            let wire = stats.wire_count as u64;
+            let compressed = stats.compressor_page_count as u64;
+            let used = (active + wire + compressed).saturating_mul(page_size);
+            m.used_bytes = used.min(m.total_bytes);
+        }
+
+        let mut swap = std::mem::zeroed::<libc::xsw_usage>();
+        if sysctl_into("vm.swapusage", &mut swap) {
+            m.swap_total_bytes = swap.xsu_total;
+            m.swap_used_bytes = swap.xsu_used;
+        }
+    }
+
+    m
+}
+
+#[cfg(target_os = "linux")]
 fn read_cpu_count() -> String {
     let mut cores = 0;
     let mut physical_ids = std::collections::HashSet::new();
@@ -472,6 +666,25 @@ fn read_cpu_count() -> String {
     format!("{} {}, {} {}", cpu_str, sockets, cores, core_str)
 }
 
+#[cfg(target_os = "macos")]
+fn read_cpu_count() -> String {
+    let cores = read_logical_cpu_count();
+    let sockets = sysctl_i32("hw.packages").filter(|v| *v > 0).unwrap_or(1) as u64;
+    let cpu_str = if sockets == 1 { "CPU:" } else { "CPUs:" };
+    let core_str = if cores == 1 { "core" } else { "cores" };
+    format!("{} {}, {} {}", cpu_str, sockets, cores, core_str)
+}
+
+#[cfg(target_os = "macos")]
+fn read_logical_cpu_count() -> u64 {
+    sysctl_i32("hw.logicalcpu")
+        .or_else(|| sysctl_i32("hw.ncpu"))
+        .filter(|v| *v > 0)
+        .map(|v| v as u64)
+        .unwrap_or(1)
+}
+
+#[cfg(target_os = "linux")]
 fn read_gpu(s: &mut Sampler, mem: &MemorySnapshot, cached_gpu: &mut GpuSnapshot, last_gpu_read: &mut Instant) -> GpuSnapshot {
     let now = Instant::now();
     if now.duration_since(*last_gpu_read) < Duration::from_millis(800) && last_gpu_read.elapsed() < Duration::from_secs(10000) {
@@ -701,6 +914,25 @@ fn read_gpu(s: &mut Sampler, mem: &MemorySnapshot, cached_gpu: &mut GpuSnapshot,
     g
 }
 
+#[cfg(target_os = "macos")]
+fn read_gpu(
+    _s: &mut Sampler,
+    _mem: &MemorySnapshot,
+    cached_gpu: &mut GpuSnapshot,
+    last_gpu_read: &mut Instant,
+) -> GpuSnapshot {
+    let now = Instant::now();
+    if now.duration_since(*last_gpu_read) < Duration::from_millis(800) {
+        return cached_gpu.clone();
+    }
+    *last_gpu_read = now;
+
+    let g = GpuSnapshot::default();
+    *cached_gpu = g.clone();
+    g
+}
+
+#[cfg(target_os = "linux")]
 fn read_network(prev_net: &mut HashMap<String, (u64, u64)>, elapsed: f64) -> NetworkSnapshot {
     let mut best = NetworkSnapshot { iface: "-".to_string(), rx_rate: 0.0, tx_rate: 0.0 };
     if let Ok(content) = fs::read_to_string("/proc/net/dev") {
@@ -733,6 +965,52 @@ fn read_network(prev_net: &mut HashMap<String, (u64, u64)>, elapsed: f64) -> Net
     best
 }
 
+#[cfg(target_os = "macos")]
+fn read_network(prev_net: &mut HashMap<String, (u64, u64)>, elapsed: f64) -> NetworkSnapshot {
+    let mut best = NetworkSnapshot { iface: "-".to_string(), rx_rate: 0.0, tx_rate: 0.0 };
+    let mut cur_net: HashMap<String, (u64, u64)> = HashMap::new();
+
+    unsafe {
+        let mut addrs: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut addrs) != 0 {
+            return best;
+        }
+
+        let mut p = addrs;
+        let mut best_total = 0_u64;
+        while !p.is_null() {
+            let ifa = &*p;
+            if !ifa.ifa_addr.is_null()
+                && (*ifa.ifa_addr).sa_family as i32 == libc::AF_LINK
+                && !ifa.ifa_data.is_null()
+                && (ifa.ifa_flags & libc::IFF_LOOPBACK as u32) == 0
+            {
+                let name = CStr::from_ptr(ifa.ifa_name).to_string_lossy().into_owned();
+                let data = &*(ifa.ifa_data as *const libc::if_data);
+                let rx = data.ifi_ibytes as u64;
+                let tx = data.ifi_obytes as u64;
+                let (prev_rx, prev_tx) = prev_net.get(&name).copied().unwrap_or((rx, tx));
+                let rx_r = if rx >= prev_rx { (rx - prev_rx) as f64 / elapsed } else { 0.0 };
+                let tx_r = if tx >= prev_tx { (tx - prev_tx) as f64 / elapsed } else { 0.0 };
+                if rx + tx > best_total {
+                    best_total = rx + tx;
+                    best.iface = name.clone();
+                    best.rx_rate = rx_r;
+                    best.tx_rate = tx_r;
+                }
+                cur_net.insert(name, (rx, tx));
+            }
+            p = ifa.ifa_next;
+        }
+
+        libc::freeifaddrs(addrs);
+    }
+
+    *prev_net = cur_net;
+    best
+}
+
+#[cfg(target_os = "linux")]
 fn read_storage() -> Vec<StorageSnapshot> {
     let mut snapshots = Vec::new();
     if let Ok(content) = fs::read_to_string("/proc/mounts") {
@@ -782,6 +1060,53 @@ fn read_storage() -> Vec<StorageSnapshot> {
     snapshots
 }
 
+#[cfg(target_os = "macos")]
+fn read_storage() -> Vec<StorageSnapshot> {
+    let mut snapshots = Vec::new();
+    unsafe {
+        let count = libc::getfsstat(std::ptr::null_mut(), 0, libc::MNT_NOWAIT);
+        if count <= 0 {
+            return snapshots;
+        }
+
+        let mut mounts = vec![std::mem::zeroed::<libc::statfs>(); count as usize];
+        let bytes = (mounts.len() * std::mem::size_of::<libc::statfs>()) as libc::c_int;
+        let actual = libc::getfsstat(mounts.as_mut_ptr(), bytes, libc::MNT_NOWAIT);
+        if actual <= 0 {
+            return snapshots;
+        }
+
+        for mount in mounts.iter().take(actual as usize) {
+            let device = c_char_array_to_string(&mount.f_mntfromname);
+            if !device.starts_with("/dev/") { continue; }
+            let mount_point = c_char_array_to_string(&mount.f_mntonname);
+            if snapshots.iter().any(|s: &StorageSnapshot| s.mount_point == mount_point) { continue; }
+
+            let total = mount.f_blocks.saturating_mul(mount.f_bsize as u64);
+            let free = mount.f_bfree.saturating_mul(mount.f_bsize as u64);
+            let used = total.saturating_sub(free);
+            if total > 0 {
+                snapshots.push(StorageSnapshot {
+                    mount_point,
+                    device,
+                    used_bytes: used,
+                    total_bytes: total,
+                });
+            }
+        }
+    }
+
+    snapshots.sort_by(|a, b| {
+        if a.mount_point == "/" { std::cmp::Ordering::Less }
+        else if b.mount_point == "/" { std::cmp::Ordering::Greater }
+        else {
+            b.total_bytes.cmp(&a.total_bytes)
+                .then_with(|| a.mount_point.cmp(&b.mount_point))
+        }
+    });
+    snapshots
+}
+
 fn sample(
     s: &mut Sampler, sort: SortMode, filter: &str,
     out_cpu: &mut f64, out_mem: &mut MemorySnapshot, out_net: &mut NetworkSnapshot,
@@ -809,6 +1134,7 @@ fn sample(
     let mut new_ticks: HashMap<i32, u64> = HashMap::with_capacity(s.prev_ticks.len());
     let filter_lower = filter.to_lowercase();
 
+    #[cfg(target_os = "linux")]
     if let Ok(entries) = fs::read_dir("/proc") {
         for entry in entries.flatten() {
             let fname = entry.file_name();
@@ -858,6 +1184,95 @@ fn sample(
                         }
                     }
                 }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let initial_bytes = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+        if initial_bytes > 0 {
+            let initial_count = initial_bytes as usize / std::mem::size_of::<i32>();
+            let mut pids = vec![0_i32; initial_count + 64];
+            let bytes = (pids.len() * std::mem::size_of::<i32>()) as libc::c_int;
+            let actual_bytes = unsafe {
+                libc::proc_listallpids(pids.as_mut_ptr() as *mut libc::c_void, bytes)
+            };
+
+            if actual_bytes > 0 {
+                let actual_count = actual_bytes as usize / std::mem::size_of::<i32>();
+                let proc_cpu_denominator = elapsed * s.logical_cpus.max(1) as f64 * 1_000_000_000.0;
+                for pid in pids.into_iter().take(actual_count).filter(|pid| *pid > 0) {
+                    let mut proc_name = String::new();
+                    let mut got_name = false;
+                    if let Some(name) = s.proc_names.get(&pid) {
+                        proc_name = name.clone();
+                        got_name = true;
+                    }
+
+                    let (total_ticks, resident_size, threadnum) = if got_name {
+                        let mut info = unsafe { std::mem::zeroed::<libc::proc_taskinfo>() };
+                        let info_size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+                        let read = unsafe {
+                            libc::proc_pidinfo(
+                                pid,
+                                libc::PROC_PIDTASKINFO,
+                                0,
+                                &mut info as *mut _ as *mut libc::c_void,
+                                info_size,
+                            )
+                        };
+                        if read < info_size { continue; }
+                        (info.pti_total_user.saturating_add(info.pti_total_system), info.pti_resident_size, info.pti_threadnum)
+                    } else {
+                        let mut info = unsafe { std::mem::zeroed::<libc::proc_taskallinfo>() };
+                        let info_size = std::mem::size_of::<libc::proc_taskallinfo>() as libc::c_int;
+                        let read = unsafe {
+                            libc::proc_pidinfo(
+                                pid,
+                                libc::PROC_PIDTASKALLINFO,
+                                0,
+                                &mut info as *mut _ as *mut libc::c_void,
+                                info_size,
+                            )
+                        };
+                        if read < info_size { continue; }
+                        let mut name = c_char_array_to_string(&info.pbsd.pbi_name);
+                        if name.is_empty() {
+                            name = c_char_array_to_string(&info.pbsd.pbi_comm);
+                        }
+                        if name.is_empty() {
+                            name = format!("[{}]", pid);
+                        }
+                        proc_name = name.clone();
+                        s.proc_names.insert(pid, name);
+                        (info.ptinfo.pti_total_user.saturating_add(info.ptinfo.pti_total_system), info.ptinfo.pti_resident_size, info.ptinfo.pti_threadnum)
+                    };
+
+                    if !filter.is_empty() {
+                        let pid_str = pid.to_string();
+                        if !proc_name.to_lowercase().contains(&filter_lower) && !pid_str.contains(&filter_lower) {
+                            new_ticks.insert(pid, total_ticks);
+                            continue;
+                        }
+                    }
+
+                    let prev_t = s.prev_ticks.get(&pid).copied().unwrap_or(total_ticks);
+                    new_ticks.insert(pid, total_ticks);
+
+                    let cpu_p = if proc_cpu_denominator > 0.0 {
+                        total_ticks.saturating_sub(prev_t) as f64 * 100.0 / proc_cpu_denominator
+                    } else { 0.0 };
+
+                    s.procs.push(ProcessInfo {
+                        pid,
+                        name: proc_name,
+                        cpu_percent: cpu_p,
+                        mem_bytes: resident_size,
+                        threads: threadnum,
+                    });
+                }
+                s.proc_names.retain(|k, _| new_ticks.contains_key(k));
+            }
         }
     }
 
@@ -950,22 +1365,26 @@ fn main() {
             let mut ws = unsafe { std::mem::zeroed::<libc::winsize>() };
             unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws); }
             
+            let term_height = if ws.ws_row == 0 { 24 } else { ws.ws_row };
+            let term_width = if ws.ws_col == 0 { 80 } else { ws.ws_col as usize };
+            let mut row = 1_u16;
+
             let _ = write!(out, "\x1B[H");
             let gpu_cores_str = if !sampler.gpu_cores.is_empty() { format!("    {}", sampler.gpu_cores) } else { String::new() };
-            let _ = writeln!(out, "utop (Rust version)    {}{}\x1B[K", cpus, gpu_cores_str);
+            draw_next_line(&mut out, &mut row, term_height, term_width, false, format_args!("utop (Rust version)    {}{}", cpus, gpu_cores_str));
 
             let temp_str = if cpu_temp > -1000.0 { format!(" {:.1}°C", cpu_temp) } else { String::new() };
             let freq_str = if cpu_freq > 0.0 { format!(" @ {:.2} GHz", cpu_freq / 1000.0) } else { String::new() };
 
-            let _ = writeln!(out, "{}: {:5.1}%{}{}\x1B[K", sampler.cpu_name, cpu, freq_str, temp_str);
+            draw_next_line(&mut out, &mut row, term_height, term_width, false, format_args!("{}: {:5.1}%{}{}", sampler.cpu_name, cpu, freq_str, temp_str));
             let mem_pct = if mem.total_bytes > 0 { mem.used_bytes as f64 * 100.0 / mem.total_bytes as f64 } else { 0.0 };
-            let _ = writeln!(out, "MEM: {:5.1}% {} / {}\x1B[K", mem_pct, human_bytes(mem.used_bytes), human_bytes(mem.total_bytes));
+            draw_next_line(&mut out, &mut row, term_height, term_width, false, format_args!("MEM: {:5.1}% {} / {}", mem_pct, human_bytes(mem.used_bytes), human_bytes(mem.total_bytes)));
 
             if mem.swap_total_bytes > 0 {
                 let swp_pct = mem.swap_used_bytes as f64 * 100.0 / mem.swap_total_bytes as f64;
-                let _ = writeln!(out, "SWP: {:5.1}% {} / {}\x1B[K", swp_pct, human_bytes(mem.swap_used_bytes), human_bytes(mem.swap_total_bytes));
+                draw_next_line(&mut out, &mut row, term_height, term_width, false, format_args!("SWP: {:5.1}% {} / {}", swp_pct, human_bytes(mem.swap_used_bytes), human_bytes(mem.swap_total_bytes)));
             } else {
-                let _ = writeln!(out, "\x1B[K");
+                draw_next_line(&mut out, &mut row, term_height, term_width, false, format_args!(""));
             }
 
             if gpu.has_usage || gpu.has_mem {
@@ -975,33 +1394,33 @@ fn main() {
                     format!("  VRAM: {:5.1}% {} / {}", pct, human_bytes(gpu.mem_used), human_bytes(gpu.mem_total))
                 } else { String::new() };
                 let g_usage = if gpu.has_usage { format!("{:5.1}%", gpu.usage) } else { String::new() };
-                let _ = writeln!(out, "{}: {}{}{}\x1B[K", gpu.name, g_usage, g_temp, g_vram);
+                draw_next_line(&mut out, &mut row, term_height, term_width, false, format_args!("{}: {}{}{}", gpu.name, g_usage, g_temp, g_vram));
             } else {
-                let _ = writeln!(out, "GPU:\x1B[K");
+                draw_next_line(&mut out, &mut row, term_height, term_width, false, format_args!("GPU:"));
             }
 
             if mem.cma_total_bytes > 0 && (!gpu.has_mem || mem.cma_total_bytes != gpu.mem_total) {
                 let cma_pct = mem.cma_used_bytes as f64 * 100.0 / mem.cma_total_bytes as f64;
-                let _ = writeln!(out, "CMA: {:5.1}% {} / {}\x1B[K", cma_pct, human_bytes(mem.cma_used_bytes), human_bytes(mem.cma_total_bytes));
+                draw_next_line(&mut out, &mut row, term_height, term_width, false, format_args!("CMA: {:5.1}% {} / {}", cma_pct, human_bytes(mem.cma_used_bytes), human_bytes(mem.cma_total_bytes)));
             }
 
-            let _ = writeln!(out, "NET: {}  rx {}/s  tx {}/s\x1B[K", net.iface, human_bytes(net.rx_rate as u64), human_bytes(net.tx_rate as u64));
+            draw_next_line(&mut out, &mut row, term_height, term_width, false, format_args!("NET: {}  rx {}/s  tx {}/s", net.iface, human_bytes(net.rx_rate as u64), human_bytes(net.tx_rate as u64)));
             
             for s in storage.iter().take(3) {
                 let pct = if s.total_bytes > 0 { s.used_bytes as f64 * 100.0 / s.total_bytes as f64 } else { 0.0 };
-                let _ = writeln!(out, "DSK: {:<10} {:5.1}% {} / {} [{}]\x1B[K", s.mount_point, pct, human_bytes(s.used_bytes), human_bytes(s.total_bytes), s.device);
+                draw_next_line(&mut out, &mut row, term_height, term_width, false, format_args!("DSK: {:<10} {:5.1}% {} / {} [{}]", s.mount_point, pct, human_bytes(s.used_bytes), human_bytes(s.total_bytes), s.device));
             }
 
-            let _ = writeln!(out, "Controls: q:quit, j/k/arrows:move, h/l/arrows:sort, /:filter [{}]\x1B[K", if is_search { "SEARCHING" } else { "NORMAL" });
+            draw_next_line(&mut out, &mut row, term_height, term_width, false, format_args!("Controls: q:quit, j/k/arrows:move, h/l/arrows:sort, /:filter [{}]", if is_search { "SEARCHING" } else { "NORMAL" }));
 
             if is_search {
-                let _ = writeln!(out, "Filter: /{}_\x1B[K", filter);
+                draw_next_line(&mut out, &mut row, term_height, term_width, false, format_args!("Filter: /{}_", filter));
             } else if !filter.is_empty() {
-                let _ = writeln!(out, "Filter: {} (press / to edit)\x1B[K", filter);
+                draw_next_line(&mut out, &mut row, term_height, term_width, false, format_args!("Filter: {} (press / to edit)", filter));
             } else {
-                let _ = writeln!(out, "\x1B[K");
+                draw_next_line(&mut out, &mut row, term_height, term_width, false, format_args!(""));
             }
-            let _ = writeln!(out, "\x1B[K");
+            draw_next_line(&mut out, &mut row, term_height, term_width, false, format_args!(""));
 
             let pid_w = 7;
             let cpu_w = 8;
@@ -1012,25 +1431,20 @@ fn main() {
             let mem_hdr = if sort == SortMode::Mem { "MEM▼" } else { "MEM" };
 
             let sort_extra = (if sort == SortMode::Cpu { 2isize } else { 0 }) + (if sort == SortMode::Mem { 2 } else { 0 });
-            let name_w = (ws.ws_col as isize - (pid_w as isize + cpu_w as isize + mem_w as isize + thr_w as isize + 5 + sort_extra)).max(12) as usize;
+            let name_w = (term_width as isize - (pid_w as isize + cpu_w as isize + mem_w as isize + thr_w as isize + 9 + sort_extra)).max(12) as usize;
 
             let w1 = cpu_w + if sort == SortMode::Cpu { 2 } else { 0 };
             let w2 = mem_w + if sort == SortMode::Mem { 2 } else { 0 };
 
-            let _ = writeln!(out, "{:<pid_w$} {:<name_w$} {:>w1$} {:>w2$} {:>thr_w$}\x1B[K", "PID", "NAME", cpu_hdr, mem_hdr, "THR",
-                pid_w=pid_w, name_w=name_w, w1=w1, w2=w2, thr_w=thr_w);
+            draw_next_line(&mut out, &mut row, term_height, term_width, false, format_args!("{:<pid_w$} {:<name_w$} {:>w1$} {:>w2$} {:>thr_w$}", "PID", "NAME", cpu_hdr, mem_hdr, "THR",
+                pid_w=pid_w, name_w=name_w, w1=w1, w2=w2, thr_w=thr_w));
 
-            let max_dashes = ws.ws_col as usize;
+            let max_dashes = term_width;
             let req_dashes = pid_w + name_w + cpu_w + mem_w + thr_w + 4;
             let num_dashes = max_dashes.min(req_dashes);
-            for _ in 0..num_dashes { let _ = write!(out, "-"); }
-            let _ = writeln!(out, "\x1B[K");
+            draw_next_line(&mut out, &mut row, term_height, term_width, false, format_args!("{}", "-".repeat(num_dashes)));
 
-            let mut header_lines = 11;
-            if mem.cma_total_bytes > 0 && (!gpu.has_mem || mem.cma_total_bytes != gpu.mem_total) { header_lines += 1; }
-            header_lines += storage.len().min(3);
-
-            let visible = ws.ws_row.saturating_sub(header_lines as u16 + 1) as usize;
+            let visible = term_height.saturating_sub(row) as usize;
             let count = sampler.procs.len();
             if selection >= count && count > 0 { selection = count - 1; }
             if count == 0 { selection = 0; }
@@ -1039,22 +1453,21 @@ fn main() {
             if scroll_top > count.saturating_sub(visible) { scroll_top = count.saturating_sub(visible); }
 
             for i in scroll_top..count.min(scroll_top + visible) {
-                if i == selection { let _ = write!(out, "\x1B[7m"); }
-
                 let p = &sampler.procs[i];
                 let mut p_name = p.name.clone();
                 if p_name.chars().count() > name_w {
                     p_name = p_name.chars().take(name_w).collect();
                 }
 
-                let _ = writeln!(out, "{:<pid_w$} {:<name_w$} {:>w1$.1} {:>mem_w$} {:>thr_w$}\x1B[0m\x1B[K",
+                draw_next_line(&mut out, &mut row, term_height, term_width, i == selection, format_args!("{:<pid_w$} {:<name_w$} {:>w1$.1} {:>mem_w$} {:>thr_w$}",
                     p.pid, p_name, p.cpu_percent, human_bytes(p.mem_bytes), p.threads,
-                    pid_w=pid_w, name_w=name_w, w1=cpu_w, mem_w=mem_w, thr_w=thr_w);
+                    pid_w=pid_w, name_w=name_w, w1=w1, mem_w=w2, thr_w=thr_w));
             }
-            let _ = write!(out, "\x1B[J");
+            let clear_row = row.min(term_height);
+            let _ = write!(out, "\x1B[{};1H\x1B[J", clear_row);
             if count > 0 {
                 let end_idx = count.min(scroll_top + visible);
-                let _ = write!(out, "\x1B[{};1HShowing {}-{} of {}\x1B[K", ws.ws_row, scroll_top + 1, end_idx, count);
+                let _ = draw_line(&mut out, term_height, term_width, false, format_args!("Showing {}-{} of {}", scroll_top + 1, end_idx, count));
             }
             let _ = out.flush();
             last_render = now;
@@ -1151,5 +1564,41 @@ mod tests {
         assert_eq!(human_bytes(1024), "1.0 KiB");
         assert_eq!(human_bytes(1024 * 1024), "1.0 MiB");
         assert_eq!(human_bytes(1024 * 1024 * 1024), "1.00 GiB");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn test_sample_populates_core_data() {
+        let mut sampler = Sampler::new();
+        let mut cpu = 0.0;
+        let mut mem = MemorySnapshot::default();
+        let mut net = NetworkSnapshot::default();
+        let mut gpu = GpuSnapshot::default();
+        let mut storage = Vec::new();
+        let mut cpus = String::new();
+        let mut cached_gpu = GpuSnapshot::default();
+        let mut last_gpu_read = Instant::now().checked_sub(Duration::from_secs(10)).unwrap();
+
+        sample(
+            &mut sampler,
+            SortMode::Cpu,
+            "",
+            &mut cpu,
+            &mut mem,
+            &mut net,
+            &mut gpu,
+            &mut storage,
+            &mut cpus,
+            &mut cached_gpu,
+            &mut last_gpu_read,
+        );
+
+        assert!(!cpus.is_empty());
+        assert!(cpu >= 0.0);
+        assert!(mem.total_bytes > 0);
+        assert!(!sampler.procs.is_empty());
+
+        #[cfg(target_os = "macos")]
+        assert!(!storage.is_empty());
     }
 }
