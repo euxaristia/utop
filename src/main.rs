@@ -55,10 +55,14 @@ use windows_sys::Win32::Storage::FileSystem::{
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::System::Registry::{
     RegOpenKeyExW, RegQueryValueExW, RegCloseKey, HKEY_LOCAL_MACHINE,
-    KEY_READ, REG_SZ, REG_DWORD,
+    KEY_READ, REG_SZ,
 };
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::System::Threading::WaitForSingleObject;
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::System::Power::{
+    CallNtPowerInformation, ProcessorInformation, PROCESSOR_POWER_INFORMATION,
+};
 
 #[derive(Default, Clone)]
 struct CpuTimes {
@@ -476,26 +480,6 @@ fn win_reg_read_string(subkey: &[u16], value_name: &[u16]) -> Option<String> {
 }
 
 #[cfg(target_os = "windows")]
-fn win_reg_read_dword(subkey: &[u16], value_name: &[u16]) -> Option<u32> {
-    unsafe {
-        let mut hkey: windows_sys::Win32::System::Registry::HKEY = std::ptr::null_mut();
-        if RegOpenKeyExW(HKEY_LOCAL_MACHINE, subkey.as_ptr(), 0, KEY_READ, &mut hkey) != 0 {
-            return None;
-        }
-        let mut value: u32 = 0;
-        let mut size = 4u32;
-        let mut reg_type: u32 = 0;
-        let result = RegQueryValueExW(
-            hkey, value_name.as_ptr(), std::ptr::null(),
-            &mut reg_type, &mut value as *mut u32 as *mut u8, &mut size,
-        );
-        RegCloseKey(hkey);
-        if result != 0 || reg_type != REG_DWORD { return None; }
-        Some(value)
-    }
-}
-
-#[cfg(target_os = "windows")]
 fn win_wstr(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -577,11 +561,29 @@ fn read_cpu_freq(_cached_paths: &mut Vec<String>) -> f64 {
 
 #[cfg(target_os = "windows")]
 fn read_cpu_freq(_cached_paths: &mut Vec<String>) -> f64 {
-    let subkey = win_wstr("HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0");
-    let value_name = win_wstr("~MHz");
-    win_reg_read_dword(&subkey, &value_name)
-        .map(|mhz| mhz as f64)
-        .unwrap_or(0.0)
+    unsafe {
+        let mut si: SYSTEM_INFO = std::mem::zeroed();
+        GetSystemInfo(&mut si);
+        let count = si.dwNumberOfProcessors as usize;
+        if count == 0 {
+            return 0.0;
+        }
+        let size = count * std::mem::size_of::<PROCESSOR_POWER_INFORMATION>();
+        let mut info: Vec<PROCESSOR_POWER_INFORMATION> = Vec::with_capacity(count);
+        let ret = CallNtPowerInformation(
+            ProcessorInformation,
+            std::ptr::null(),
+            0,
+            info.as_mut_ptr() as *mut core::ffi::c_void,
+            size as u32,
+        );
+        if ret == 0 {
+            info.set_len(count);
+            info[0].CurrentMhz as f64
+        } else {
+            0.0
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
