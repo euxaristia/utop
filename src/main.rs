@@ -63,12 +63,6 @@ use windows_sys::Win32::System::Threading::WaitForSingleObject;
 use windows_sys::Win32::System::Power::{
     CallNtPowerInformation, ProcessorInformation, PROCESSOR_POWER_INFORMATION,
 };
-#[cfg(target_os = "windows")]
-use windows_sys::Win32::System::Performance::{
-    PdhOpenQueryW, PdhAddEnglishCounterW, PdhCollectQueryData,
-    PdhGetFormattedCounterValue, PdhCloseQuery,
-    PDH_FMT_COUNTERVALUE, PDH_FMT_DOUBLE,
-};
 
 #[derive(Default, Clone)]
 struct CpuTimes {
@@ -580,34 +574,15 @@ fn read_cpu_freq(_cached_paths: &mut Vec<String>) -> f64 {
             (count * std::mem::size_of::<PROCESSOR_POWER_INFORMATION>()) as u32,
         );
         if ret != 0 { return 0.0; }
-        let base_mhz = pinfo[0].MaxMhz as f64;
-        if base_mhz <= 0.0 { return 0.0; }
 
-        // Read current frequency via PDH performance counter
-        let path = win_wstr("\\Processor Information(0)\\% of Maximum Frequency");
-        let mut query: isize = 0;
-        let mut counter: isize = 0;
-        if PdhOpenQueryW(std::ptr::null(), 0, &mut query) != 0 { return base_mhz; }
-        if PdhAddEnglishCounterW(query, path.as_ptr(), 0, &mut counter) != 0 {
-            PdhCloseQuery(query);
-            return base_mhz;
+        // MhzLimit includes turbo headroom; CurrentMhz is the actual frequency.
+        // Pick the highest across all processors.
+        let mut best = pinfo[0].MaxMhz;
+        for p in &pinfo {
+            if p.CurrentMhz > best { best = p.CurrentMhz; }
+            if p.MhzLimit > best { best = p.MhzLimit; }
         }
-        // First collect initializes the counter
-        PdhCollectQueryData(query);
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        // Second collect gives a meaningful delta
-        PdhCollectQueryData(query);
-        let mut value: PDH_FMT_COUNTERVALUE = std::mem::zeroed();
-        let mut counter_type: u32 = 0;
-        let status = PdhGetFormattedCounterValue(counter, PDH_FMT_DOUBLE, &mut counter_type, &mut value);
-        PdhCloseQuery(query);
-        if status == 0 && value.CStatus == 0 {
-            let pct = value.Anonymous.doubleValue;
-            if pct > 0.0 {
-                return base_mhz * pct / 100.0;
-            }
-        }
-        base_mhz
+        best as f64
     }
 }
 
@@ -2218,6 +2193,15 @@ mod tests {
             assert!(s.total_bytes > 0, "total bytes > 0 for {}", s.mount_point);
             assert!(s.used_bytes <= s.total_bytes, "used <= total for {}", s.mount_point);
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_read_cpu_freq_windows() {
+        let freq = read_cpu_freq(&mut Vec::new());
+        eprintln!("debug: read_cpu_freq returned {freq} MHz");
+        assert!(freq > 0.0, "CPU frequency should be > 0, got {freq}");
+        assert!(freq < 100_000.0, "CPU frequency unrealistic, got {freq}");
     }
 
     #[cfg(target_os = "windows")]
