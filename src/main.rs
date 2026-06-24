@@ -565,24 +565,27 @@ fn read_cpu_freq(_cached_paths: &mut Vec<String>) -> f64 {
         let mut si: SYSTEM_INFO = std::mem::zeroed();
         GetSystemInfo(&mut si);
         let count = si.dwNumberOfProcessors as usize;
-        if count == 0 {
-            return 0.0;
-        }
-        let size = count * std::mem::size_of::<PROCESSOR_POWER_INFORMATION>();
-        let mut info: Vec<PROCESSOR_POWER_INFORMATION> = Vec::with_capacity(count);
+        if count == 0 { return 0.0; }
+
+        let mut info: Vec<PROCESSOR_POWER_INFORMATION> = vec![
+            std::mem::zeroed(); count
+        ];
         let ret = CallNtPowerInformation(
             ProcessorInformation,
             std::ptr::null(),
             0,
             info.as_mut_ptr() as *mut core::ffi::c_void,
-            size as u32,
+            (count * std::mem::size_of::<PROCESSOR_POWER_INFORMATION>()) as u32,
         );
-        if ret == 0 {
-            info.set_len(count);
-            info[0].CurrentMhz as f64
-        } else {
-            0.0
+        if ret != 0 { return 0.0; }
+
+        let mut cur = 0u32;
+        for p in &info {
+            if p.CurrentMhz > cur { cur = p.CurrentMhz; }
+            if p.MhzLimit > cur { cur = p.MhzLimit; }
         }
+        if cur == 0 { cur = info[0].MaxMhz; }
+        cur as f64
     }
 }
 
