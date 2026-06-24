@@ -2140,4 +2140,90 @@ mod tests {
         #[cfg(target_os = "macos")]
         assert!(!storage.is_empty());
     }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_read_memory_windows() {
+        let mem = read_memory();
+        assert!(mem.total_bytes > 0, "total memory should be > 0");
+        assert!(mem.total_bytes >= mem.used_bytes, "total >= used");
+        assert!(mem.total_bytes >= 128 * 1024 * 1024, "total memory >= 128 MiB");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_read_swap_windows() {
+        let mem = read_memory();
+        assert!(mem.swap_total_bytes > 0, "swap total should be > 0, got {}", mem.swap_total_bytes);
+        assert!(mem.swap_used_bytes <= mem.swap_total_bytes, "swap used ({}) <= total ({})", mem.swap_used_bytes, mem.swap_total_bytes);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_read_cpu_count_windows() {
+        let cpus = read_cpu_count();
+        assert!(!cpus.is_empty(), "CPU count string should not be empty");
+        let cores: u32 = cpus.split_whitespace().nth(2)
+            .and_then(|w| w.trim_end_matches(',').parse().ok())
+            .unwrap_or(0);
+        assert!(cores > 0, "CPU core count should be > 0, got '{cpus}'");
+        assert!(cores <= 256, "CPU core count should be reasonable, got {cores}");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_read_network_windows() {
+        let mut prev = HashMap::new();
+        let elapsed = 1.0;
+        let net = read_network(&mut prev, elapsed);
+        assert!(!net.iface.is_empty(), "network interface should not be empty");
+        assert!(net.rx_rate >= 0.0, "rx rate >= 0");
+        assert!(net.tx_rate >= 0.0, "tx rate >= 0");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_read_storage_windows() {
+        let storage = read_storage();
+        assert!(!storage.is_empty(), "should have at least one storage device");
+        for s in &storage {
+            assert!(!s.device.is_empty(), "device should not be empty");
+            assert!(s.total_bytes > 0, "total bytes > 0 for {}", s.mount_point);
+            assert!(s.used_bytes <= s.total_bytes, "used <= total for {}", s.mount_point);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_sample_windows() {
+        let mut sampler = Sampler::new();
+        let mut cpu = 0.0;
+        let mut mem = MemorySnapshot::default();
+        let mut net = NetworkSnapshot::default();
+        let mut gpu = GpuSnapshot::default();
+        let mut storage = Vec::new();
+        let mut cpus = String::new();
+        let mut cached_gpu = GpuSnapshot::default();
+        let mut last_gpu_read = Instant::now().checked_sub(Duration::from_secs(10)).unwrap();
+
+        sample(
+            &mut sampler,
+            SortMode::Cpu,
+            "",
+            &mut cpu,
+            &mut mem,
+            &mut net,
+            &mut gpu,
+            &mut storage,
+            &mut cpus,
+            &mut cached_gpu,
+            &mut last_gpu_read,
+        );
+
+        assert!(cpu >= 0.0);
+        assert!(mem.total_bytes > 0);
+        assert!(!sampler.procs.is_empty(), "should have at least one process");
+        assert!(!cpus.is_empty(), "CPU count should be populated");
+        assert!(!storage.is_empty(), "should have at least one storage device");
+    }
 }
