@@ -879,8 +879,11 @@ fn read_memory() -> MemorySnapshot {
         if GlobalMemoryStatusEx(&mut status) != 0 {
             m.total_bytes = status.ullTotalPhys;
             m.used_bytes = status.ullTotalPhys.saturating_sub(status.ullAvailPhys);
-            m.swap_total_bytes = status.ullTotalPageFile;
-            m.swap_used_bytes = status.ullTotalPageFile.saturating_sub(status.ullAvailPageFile);
+            let swap_total = status.ullTotalPageFile.saturating_sub(status.ullTotalPhys);
+            let committed = status.ullTotalPageFile.saturating_sub(status.ullAvailPageFile);
+            let phys_used = status.ullTotalPhys.saturating_sub(status.ullAvailPhys);
+            m.swap_total_bytes = swap_total;
+            m.swap_used_bytes = committed.saturating_sub(phys_used);
         }
     }
     m
