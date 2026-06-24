@@ -33,6 +33,7 @@ use windows_sys::Win32::System::Threading::{
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::System::ProcessStatus::{
     K32GetProcessMemoryInfo, GetPerformanceInfo, PERFORMANCE_INFORMATION,
+    K32EnumPageFilesW, ENUM_PAGE_FILE_INFORMATION,
 };
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
@@ -873,6 +874,20 @@ fn read_memory() -> MemorySnapshot {
 }
 
 #[cfg(target_os = "windows")]
+unsafe extern "system" fn enum_pf_callback(
+    pcontext: *mut core::ffi::c_void,
+    ppagefileinfo: *mut ENUM_PAGE_FILE_INFORMATION,
+    _lpfilename: windows_sys::core::PCWSTR,
+) -> BOOL {
+    unsafe {
+        let info = &*ppagefileinfo;
+        let out = &mut *(pcontext as *mut (u64, u64));
+        *out = (info.TotalInUse as u64, info.TotalSize as u64);
+    }
+    1
+}
+
+#[cfg(target_os = "windows")]
 fn read_memory() -> MemorySnapshot {
     let mut m = MemorySnapshot::default();
     unsafe {
@@ -885,11 +900,16 @@ fn read_memory() -> MemorySnapshot {
         if GetPerformanceInfo(&mut pi, pi.cb) != 0 {
             m.total_bytes = (pi.PhysicalTotal as u64) * page_size;
             m.used_bytes = (pi.PhysicalTotal.saturating_sub(pi.PhysicalAvailable) as u64) * page_size;
-            let pf_total = pi.CommitLimit.saturating_sub(pi.PhysicalTotal) as u64 * page_size;
-            let phys_in_use = pi.PhysicalTotal.saturating_sub(pi.PhysicalAvailable);
-            let pf_used = pi.CommitTotal.saturating_sub(phys_in_use) as u64 * page_size;
-            m.swap_total_bytes = pf_total;
-            m.swap_used_bytes = std::cmp::min(pf_used, pf_total);
+        }
+
+        let mut pf_info: (u64, u64) = (0, 0);
+        K32EnumPageFilesW(
+            Some(enum_pf_callback),
+            &mut pf_info as *mut _ as *mut core::ffi::c_void,
+        );
+        if pf_info.1 > 0 {
+            m.swap_total_bytes = pf_info.1 * page_size;
+            m.swap_used_bytes = std::cmp::min(pf_info.0 * page_size, pf_info.1 * page_size);
         }
     }
     m
