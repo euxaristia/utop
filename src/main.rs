@@ -876,16 +876,20 @@ fn read_memory() -> MemorySnapshot {
 fn read_memory() -> MemorySnapshot {
     let mut m = MemorySnapshot::default();
     unsafe {
+        let mut si: SYSTEM_INFO = std::mem::zeroed();
+        GetSystemInfo(&mut si);
+        let page_size = si.dwPageSize as u64;
+
         let mut pi: PERFORMANCE_INFORMATION = std::mem::zeroed();
         pi.cb = std::mem::size_of::<PERFORMANCE_INFORMATION>() as u32;
         if GetPerformanceInfo(&mut pi, pi.cb) != 0 {
-            m.total_bytes = pi.PhysicalTotal as u64;
-            m.used_bytes = pi.PhysicalTotal.saturating_sub(pi.PhysicalAvailable) as u64;
-            let pf_total = pi.CommitLimit.saturating_sub(pi.PhysicalTotal);
+            m.total_bytes = (pi.PhysicalTotal as u64) * page_size;
+            m.used_bytes = (pi.PhysicalTotal.saturating_sub(pi.PhysicalAvailable) as u64) * page_size;
+            let pf_total = pi.CommitLimit.saturating_sub(pi.PhysicalTotal) as u64 * page_size;
             let phys_in_use = pi.PhysicalTotal.saturating_sub(pi.PhysicalAvailable);
-            let pf_used = pi.CommitTotal.saturating_sub(phys_in_use);
-            m.swap_total_bytes = pf_total as u64;
-            m.swap_used_bytes = std::cmp::min(pf_used, pf_total) as u64;
+            let pf_used = pi.CommitTotal.saturating_sub(phys_in_use) as u64 * page_size;
+            m.swap_total_bytes = pf_total;
+            m.swap_used_bytes = std::cmp::min(pf_used, pf_total);
         }
     }
     m
