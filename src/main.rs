@@ -31,7 +31,9 @@ use windows_sys::Win32::System::Threading::{
     PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
 };
 #[cfg(target_os = "windows")]
-use windows_sys::Win32::System::ProcessStatus::K32GetProcessMemoryInfo;
+use windows_sys::Win32::System::ProcessStatus::{
+    K32GetProcessMemoryInfo, GetPerformanceInfo, PERFORMANCE_INFORMATION,
+};
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW,
@@ -39,7 +41,7 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
 };
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::System::SystemInformation::{
-    GetSystemInfo, GlobalMemoryStatusEx, MEMORYSTATUSEX, SYSTEM_INFO,
+    GetSystemInfo, SYSTEM_INFO,
 };
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::NetworkManagement::IpHelper::{
@@ -874,16 +876,16 @@ fn read_memory() -> MemorySnapshot {
 fn read_memory() -> MemorySnapshot {
     let mut m = MemorySnapshot::default();
     unsafe {
-        let mut status: MEMORYSTATUSEX = std::mem::zeroed();
-        status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-        if GlobalMemoryStatusEx(&mut status) != 0 {
-            m.total_bytes = status.ullTotalPhys;
-            m.used_bytes = status.ullTotalPhys.saturating_sub(status.ullAvailPhys);
-            let swap_total = status.ullTotalPageFile.saturating_sub(status.ullTotalPhys);
-            let committed = status.ullTotalPageFile.saturating_sub(status.ullAvailPageFile);
-            let phys_used = status.ullTotalPhys.saturating_sub(status.ullAvailPhys);
-            m.swap_total_bytes = swap_total;
-            m.swap_used_bytes = committed.saturating_sub(phys_used);
+        let mut pi: PERFORMANCE_INFORMATION = std::mem::zeroed();
+        pi.cb = std::mem::size_of::<PERFORMANCE_INFORMATION>() as u32;
+        if GetPerformanceInfo(&mut pi, pi.cb) != 0 {
+            m.total_bytes = pi.PhysicalTotal as u64;
+            m.used_bytes = pi.PhysicalTotal.saturating_sub(pi.PhysicalAvailable) as u64;
+            let pf_total = pi.CommitLimit.saturating_sub(pi.PhysicalTotal);
+            let phys_in_use = pi.PhysicalTotal.saturating_sub(pi.PhysicalAvailable);
+            let pf_used = pi.CommitTotal.saturating_sub(phys_in_use);
+            m.swap_total_bytes = pf_total as u64;
+            m.swap_used_bytes = std::cmp::min(pf_used, pf_total) as u64;
         }
     }
     m
