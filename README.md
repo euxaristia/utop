@@ -13,6 +13,7 @@
 - Sorting by CPU or Memory.
 - Instant search/filter support.
 - Adaptive layout (scales to terminal size).
+- Colour-coded metrics and hot process rows, with `NO_COLOR=1` or `CLICOLOR=0` support.
 
 ## Requirements
 

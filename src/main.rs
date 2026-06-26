@@ -329,6 +329,102 @@ fn clip_to_width(line: &str, width: usize) -> String {
     line.chars().take(width).collect()
 }
 
+const STYLE_NONE: &str = "";
+const STYLE_TITLE: &str = "\x1B[1m\x1B[38;5;51m";
+const STYLE_SECTION: &str = "\x1B[1m\x1B[38;5;45m";
+const STYLE_OK: &str = "\x1B[38;5;82m";
+const STYLE_WARN: &str = "\x1B[38;5;220m";
+const STYLE_BAD: &str = "\x1B[38;5;203m";
+const STYLE_INFO: &str = "\x1B[38;5;75m";
+const STYLE_ACCENT: &str = "\x1B[38;5;213m";
+const STYLE_MUTED: &str = "\x1B[38;5;244m";
+
+fn colour_enabled() -> bool {
+    if std::env::var_os("NO_COLOR").is_some() {
+        return false;
+    }
+    if std::env::var("CLICOLOR_FORCE").is_ok_and(|v| v != "0") {
+        return true;
+    }
+    if std::env::var("CLICOLOR").is_ok_and(|v| v == "0") {
+        return false;
+    }
+    if std::env::var("TERM").is_ok_and(|term| term == "dumb") {
+        return false;
+    }
+
+    stdout_is_tty()
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn stdout_is_tty() -> bool {
+    unsafe { libc::isatty(libc::STDOUT_FILENO) == 1 }
+}
+
+#[cfg(target_os = "windows")]
+fn stdout_is_tty() -> bool {
+    unsafe {
+        let h = GetStdHandle(STD_OUTPUT_HANDLE);
+        if h.is_null() || h == INVALID_HANDLE_VALUE {
+            return false;
+        }
+        let mut mode: u32 = 0;
+        GetConsoleMode(h, &mut mode) != 0
+    }
+}
+
+fn colour(enabled: bool, style: &'static str) -> &'static str {
+    if enabled { style } else { STYLE_NONE }
+}
+
+fn usage_style(percent: f64, enabled: bool) -> &'static str {
+    if !enabled {
+        STYLE_NONE
+    } else if percent >= 85.0 {
+        STYLE_BAD
+    } else if percent >= 65.0 {
+        STYLE_WARN
+    } else {
+        STYLE_OK
+    }
+}
+
+fn process_row_style(cpu_percent: f64, mem_bytes: u64, total_mem_bytes: u64, enabled: bool) -> &'static str {
+    if !enabled {
+        return STYLE_NONE;
+    }
+
+    let mem_percent = if total_mem_bytes > 0 {
+        mem_bytes as f64 * 100.0 / total_mem_bytes as f64
+    } else {
+        0.0
+    };
+
+    if cpu_percent >= 50.0 || mem_percent >= 25.0 {
+        STYLE_BAD
+    } else if cpu_percent >= 15.0 || mem_percent >= 10.0 {
+        STYLE_WARN
+    } else {
+        STYLE_NONE
+    }
+}
+
+fn draw_line_with_style<W: Write>(
+    out: &mut W,
+    row: u16,
+    width: usize,
+    reverse: bool,
+    style: &str,
+    args: fmt::Arguments<'_>,
+) -> io::Result<()> {
+    let line = clip_to_width(&args.to_string(), width);
+    if reverse {
+        write!(out, "\x1B[{};1H\x1B[0m\x1B[7m{}\x1B[0m\x1B[K", row, line)
+    } else {
+        write!(out, "\x1B[{};1H\x1B[0m{}{}\x1B[0m\x1B[K", row, style, line)
+    }
+}
+
 fn draw_line<W: Write>(
     out: &mut W,
     row: u16,
@@ -336,12 +432,7 @@ fn draw_line<W: Write>(
     reverse: bool,
     args: fmt::Arguments<'_>,
 ) -> io::Result<()> {
-    let line = clip_to_width(&args.to_string(), width);
-    if reverse {
-        write!(out, "\x1B[{};1H\x1B[0m\x1B[7m{}\x1B[0m\x1B[K", row, line)
-    } else {
-        write!(out, "\x1B[{};1H\x1B[0m{}\x1B[K", row, line)
-    }
+    draw_line_with_style(out, row, width, reverse, STYLE_NONE, args)
 }
 
 fn draw_next_line<W: Write>(
@@ -354,6 +445,21 @@ fn draw_next_line<W: Write>(
 ) {
     if *row <= height {
         let _ = draw_line(out, *row, width, reverse, args);
+    }
+    *row = (*row).saturating_add(1);
+}
+
+fn draw_next_line_with_style<W: Write>(
+    out: &mut W,
+    row: &mut u16,
+    height: u16,
+    width: usize,
+    reverse: bool,
+    style: &str,
+    args: fmt::Arguments<'_>,
+) {
+    if *row <= height {
+        let _ = draw_line_with_style(out, *row, width, reverse, style, args);
     }
     *row = (*row).saturating_add(1);
 }
@@ -1865,6 +1971,7 @@ fn main() {
     let mut filter = String::new();
     let mut is_search = false;
     let mut selection = 0_usize;
+    let colours = colour_enabled();
 
     let mut last_sample = Instant::now();
     let mut last_render = Instant::now();
@@ -1922,18 +2029,18 @@ fn main() {
 
             let _ = write!(out, "\x1B[H");
             let gpu_cores_str = if !sampler.gpu_cores.is_empty() { format!("    {}", sampler.gpu_cores) } else { String::new() };
-            draw_next_line(&mut out, &mut row, term_height, term_width, false, format_args!("utop (Rust version)    {}{}", cpus, gpu_cores_str));
+            draw_next_line_with_style(&mut out, &mut row, term_height, term_width, false, colour(colours, STYLE_TITLE), format_args!("utop (Rust version)    {}{}", cpus, gpu_cores_str));
 
             let temp_str = if cpu_temp > -1000.0 { format!(" {:.1}°C", cpu_temp) } else { String::new() };
             let freq_str = if cpu_freq > 0.0 { format!(" @ {:.2} GHz", cpu_freq / 1000.0) } else { String::new() };
 
-            draw_next_line(&mut out, &mut row, term_height, term_width, false, format_args!("{}: {:5.1}%{}{}", sampler.cpu_name, cpu, freq_str, temp_str));
+            draw_next_line_with_style(&mut out, &mut row, term_height, term_width, false, usage_style(cpu, colours), format_args!("{}: {:5.1}%{}{}", sampler.cpu_name, cpu, freq_str, temp_str));
             let mem_pct = if mem.total_bytes > 0 { mem.used_bytes as f64 * 100.0 / mem.total_bytes as f64 } else { 0.0 };
-            draw_next_line(&mut out, &mut row, term_height, term_width, false, format_args!("MEM: {:5.1}% {} / {}", mem_pct, human_bytes(mem.used_bytes), human_bytes(mem.total_bytes)));
+            draw_next_line_with_style(&mut out, &mut row, term_height, term_width, false, usage_style(mem_pct, colours), format_args!("MEM: {:5.1}% {} / {}", mem_pct, human_bytes(mem.used_bytes), human_bytes(mem.total_bytes)));
 
             if mem.swap_total_bytes > 0 {
                 let swp_pct = mem.swap_used_bytes as f64 * 100.0 / mem.swap_total_bytes as f64;
-                draw_next_line(&mut out, &mut row, term_height, term_width, false, format_args!("SWP: {:5.1}% {} / {}", swp_pct, human_bytes(mem.swap_used_bytes), human_bytes(mem.swap_total_bytes)));
+                draw_next_line_with_style(&mut out, &mut row, term_height, term_width, false, usage_style(swp_pct, colours), format_args!("SWP: {:5.1}% {} / {}", swp_pct, human_bytes(mem.swap_used_bytes), human_bytes(mem.swap_total_bytes)));
             } else {
                 draw_next_line(&mut out, &mut row, term_height, term_width, false, format_args!(""));
             }
@@ -1945,29 +2052,36 @@ fn main() {
                     format!("  VRAM: {:5.1}% {} / {}", pct, human_bytes(gpu.mem_used), human_bytes(gpu.mem_total))
                 } else { String::new() };
                 let g_usage = if gpu.has_usage { format!("{:5.1}%", gpu.usage) } else { String::new() };
-                draw_next_line(&mut out, &mut row, term_height, term_width, false, format_args!("{}: {}{}{}", gpu.name, g_usage, g_temp, g_vram));
+                let gpu_pct = if gpu.has_usage {
+                    gpu.usage
+                } else if gpu.has_mem && gpu.mem_total > 0 {
+                    gpu.mem_used as f64 * 100.0 / gpu.mem_total as f64
+                } else {
+                    0.0
+                };
+                draw_next_line_with_style(&mut out, &mut row, term_height, term_width, false, usage_style(gpu_pct, colours), format_args!("{}: {}{}{}", gpu.name, g_usage, g_temp, g_vram));
             } else {
-                draw_next_line(&mut out, &mut row, term_height, term_width, false, format_args!("GPU:"));
+                draw_next_line_with_style(&mut out, &mut row, term_height, term_width, false, colour(colours, STYLE_MUTED), format_args!("GPU:"));
             }
 
             if mem.cma_total_bytes > 0 && (!gpu.has_mem || mem.cma_total_bytes != gpu.mem_total) {
                 let cma_pct = mem.cma_used_bytes as f64 * 100.0 / mem.cma_total_bytes as f64;
-                draw_next_line(&mut out, &mut row, term_height, term_width, false, format_args!("CMA: {:5.1}% {} / {}", cma_pct, human_bytes(mem.cma_used_bytes), human_bytes(mem.cma_total_bytes)));
+                draw_next_line_with_style(&mut out, &mut row, term_height, term_width, false, usage_style(cma_pct, colours), format_args!("CMA: {:5.1}% {} / {}", cma_pct, human_bytes(mem.cma_used_bytes), human_bytes(mem.cma_total_bytes)));
             }
 
-            draw_next_line(&mut out, &mut row, term_height, term_width, false, format_args!("NET: {}  rx {}/s  tx {}/s", net.iface, human_bytes(net.rx_rate as u64), human_bytes(net.tx_rate as u64)));
+            draw_next_line_with_style(&mut out, &mut row, term_height, term_width, false, colour(colours, STYLE_INFO), format_args!("NET: {}  rx {}/s  tx {}/s", net.iface, human_bytes(net.rx_rate as u64), human_bytes(net.tx_rate as u64)));
             
             for s in storage.iter().take(3) {
                 let pct = if s.total_bytes > 0 { s.used_bytes as f64 * 100.0 / s.total_bytes as f64 } else { 0.0 };
-                draw_next_line(&mut out, &mut row, term_height, term_width, false, format_args!("DSK: {:<10} {:5.1}% {} / {} [{}]", s.mount_point, pct, human_bytes(s.used_bytes), human_bytes(s.total_bytes), s.device));
+                draw_next_line_with_style(&mut out, &mut row, term_height, term_width, false, usage_style(pct, colours), format_args!("DSK: {:<10} {:5.1}% {} / {} [{}]", s.mount_point, pct, human_bytes(s.used_bytes), human_bytes(s.total_bytes), s.device));
             }
 
-            draw_next_line(&mut out, &mut row, term_height, term_width, false, format_args!("Controls: q:quit, j/k/arrows:move, h/l/arrows:sort, /:filter [{}]", if is_search { "SEARCHING" } else { "NORMAL" }));
+            draw_next_line_with_style(&mut out, &mut row, term_height, term_width, false, colour(colours, STYLE_MUTED), format_args!("Controls: q:quit, j/k/arrows:move, h/l/arrows:sort, /:filter [{}]", if is_search { "SEARCHING" } else { "NORMAL" }));
 
             if is_search {
-                draw_next_line(&mut out, &mut row, term_height, term_width, false, format_args!("Filter: /{}_", filter));
+                draw_next_line_with_style(&mut out, &mut row, term_height, term_width, false, colour(colours, STYLE_ACCENT), format_args!("Filter: /{}_", filter));
             } else if !filter.is_empty() {
-                draw_next_line(&mut out, &mut row, term_height, term_width, false, format_args!("Filter: {} (press / to edit)", filter));
+                draw_next_line_with_style(&mut out, &mut row, term_height, term_width, false, colour(colours, STYLE_ACCENT), format_args!("Filter: {} (press / to edit)", filter));
             } else {
                 draw_next_line(&mut out, &mut row, term_height, term_width, false, format_args!(""));
             }
@@ -1987,13 +2101,13 @@ fn main() {
             let w1 = cpu_w + if sort == SortMode::Cpu { 2 } else { 0 };
             let w2 = mem_w + if sort == SortMode::Mem { 2 } else { 0 };
 
-            draw_next_line(&mut out, &mut row, term_height, term_width, false, format_args!("{:<pid_w$} {:<name_w$} {:>w1$} {:>w2$} {:>thr_w$}", "PID", "NAME", cpu_hdr, mem_hdr, "THR",
+            draw_next_line_with_style(&mut out, &mut row, term_height, term_width, false, colour(colours, STYLE_SECTION), format_args!("{:<pid_w$} {:<name_w$} {:>w1$} {:>w2$} {:>thr_w$}", "PID", "NAME", cpu_hdr, mem_hdr, "THR",
                 pid_w=pid_w, name_w=name_w, w1=w1, w2=w2, thr_w=thr_w));
 
             let max_dashes = term_width;
             let req_dashes = pid_w + name_w + cpu_w + mem_w + thr_w + 4;
             let num_dashes = max_dashes.min(req_dashes);
-            draw_next_line(&mut out, &mut row, term_height, term_width, false, format_args!("{}", "-".repeat(num_dashes)));
+            draw_next_line_with_style(&mut out, &mut row, term_height, term_width, false, colour(colours, STYLE_MUTED), format_args!("{}", "-".repeat(num_dashes)));
 
             let visible = term_height.saturating_sub(row) as usize;
             let count = sampler.procs.len();
@@ -2010,7 +2124,8 @@ fn main() {
                     p_name = p_name.chars().take(name_w).collect();
                 }
 
-                draw_next_line(&mut out, &mut row, term_height, term_width, i == selection, format_args!("{:<pid_w$} {:<name_w$} {:>w1$.1} {:>mem_w$} {:>thr_w$}",
+                let row_style = process_row_style(p.cpu_percent, p.mem_bytes, mem.total_bytes, colours);
+                draw_next_line_with_style(&mut out, &mut row, term_height, term_width, i == selection, row_style, format_args!("{:<pid_w$} {:<name_w$} {:>w1$.1} {:>mem_w$} {:>thr_w$}",
                     p.pid, p_name, p.cpu_percent, human_bytes(p.mem_bytes), p.threads,
                     pid_w=pid_w, name_w=name_w, w1=w1, mem_w=w2, thr_w=thr_w));
             }
@@ -2018,7 +2133,7 @@ fn main() {
             let _ = write!(out, "\x1B[{};1H\x1B[J", clear_row);
             if count > 0 {
                 let end_idx = count.min(scroll_top + visible);
-                let _ = draw_line(&mut out, term_height, term_width, false, format_args!("Showing {}-{} of {}", scroll_top + 1, end_idx, count));
+                let _ = draw_line_with_style(&mut out, term_height, term_width, false, colour(colours, STYLE_MUTED), format_args!("Showing {}-{} of {}", scroll_top + 1, end_idx, count));
             }
             let _ = out.flush();
             last_render = now;
@@ -2122,6 +2237,69 @@ mod tests {
         assert_eq!(human_bytes(1024), "1.0 KiB");
         assert_eq!(human_bytes(1024 * 1024), "1.0 MiB");
         assert_eq!(human_bytes(1024 * 1024 * 1024), "1.00 GiB");
+    }
+
+    #[test]
+    fn test_usage_style_thresholds() {
+        assert_eq!(usage_style(20.0, true), STYLE_OK);
+        assert_eq!(usage_style(70.0, true), STYLE_WARN);
+        assert_eq!(usage_style(90.0, true), STYLE_BAD);
+        assert_eq!(usage_style(90.0, false), STYLE_NONE);
+    }
+
+    #[test]
+    fn test_styled_line_clips_visible_text() {
+        let mut out = Vec::new();
+        draw_line_with_style(&mut out, 1, 3, false, STYLE_OK, format_args!("abcdef")).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+
+        assert!(rendered.contains(STYLE_OK));
+        assert!(rendered.contains("abc"));
+        assert!(!rendered.contains("abcd"));
+    }
+
+    #[test]
+    fn test_colour_enabled_env_overrides() {
+        // colour_enabled() reads process-global env vars, so run the cases
+        // sequentially in one test and restore the environment afterwards.
+        let keys = ["NO_COLOR", "CLICOLOR_FORCE", "CLICOLOR", "TERM"];
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> =
+            keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        let clear_all = || {
+            for k in keys {
+                unsafe { std::env::remove_var(k); }
+            }
+        };
+
+        // NO_COLOR disables colour, and takes precedence over CLICOLOR_FORCE.
+        clear_all();
+        unsafe { std::env::set_var("NO_COLOR", "1"); }
+        assert!(!colour_enabled());
+        unsafe { std::env::set_var("CLICOLOR_FORCE", "1"); }
+        assert!(!colour_enabled(), "NO_COLOR should take precedence over CLICOLOR_FORCE");
+
+        // CLICOLOR_FORCE forces colour on when NO_COLOR is unset.
+        clear_all();
+        unsafe { std::env::set_var("CLICOLOR_FORCE", "1"); }
+        assert!(colour_enabled());
+
+        // CLICOLOR=0 disables colour.
+        clear_all();
+        unsafe { std::env::set_var("CLICOLOR", "0"); }
+        assert!(!colour_enabled());
+
+        // TERM=dumb disables colour.
+        clear_all();
+        unsafe { std::env::set_var("TERM", "dumb"); }
+        assert!(!colour_enabled());
+
+        // Restore the original environment.
+        clear_all();
+        for (k, v) in saved {
+            if let Some(val) = v {
+                unsafe { std::env::set_var(k, val); }
+            }
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
