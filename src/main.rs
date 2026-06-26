@@ -10,7 +10,60 @@ use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 #[cfg(target_os = "linux")]
 use std::io::Read;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
+
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE, BOOL, TRUE, FILETIME, CloseHandle};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::System::Console::{
+    GetConsoleMode, SetConsoleMode, GetStdHandle, GetConsoleScreenBufferInfo,
+    CONSOLE_SCREEN_BUFFER_INFO,
+    STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    ENABLE_VIRTUAL_TERMINAL_PROCESSING, ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_PROCESSED_OUTPUT,
+    ENABLE_LINE_INPUT, ENABLE_ECHO_INPUT, ENABLE_PROCESSED_INPUT,
+    ENABLE_WINDOW_INPUT,
+    SetConsoleCtrlHandler,
+    ReadConsoleInputW, GetNumberOfConsoleInputEvents, INPUT_RECORD, KEY_EVENT_RECORD,
+};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::System::Threading::{
+    GetSystemTimes, OpenProcess, GetProcessTimes, GetActiveProcessorCount,
+    PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
+};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::System::ProcessStatus::{
+    K32GetProcessMemoryInfo, GetPerformanceInfo, PERFORMANCE_INFORMATION,
+    K32EnumPageFilesW, ENUM_PAGE_FILE_INFORMATION,
+};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW,
+    PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::System::SystemInformation::{
+    GetSystemInfo, SYSTEM_INFO,
+};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::NetworkManagement::IpHelper::{
+    GetIfTable2, FreeMibTable, MIB_IF_TABLE2,
+};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::Storage::FileSystem::{
+    GetLogicalDriveStringsW, GetDiskFreeSpaceExW,
+};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::System::Registry::{
+    RegOpenKeyExW, RegQueryValueExW, RegCloseKey, HKEY_LOCAL_MACHINE,
+    KEY_READ, REG_SZ,
+};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::System::Threading::WaitForSingleObject;
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::System::Power::{
+    CallNtPowerInformation, ProcessorInformation, PROCESSOR_POWER_INFORMATION,
+};
 
 #[derive(Default, Clone)]
 struct CpuTimes {
@@ -74,10 +127,12 @@ struct StorageSnapshot {
     total_bytes: u64,
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 struct Terminal {
     original_termios: libc::termios,
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl Terminal {
     fn init() -> io::Result<Self> {
         unsafe {
@@ -101,6 +156,7 @@ impl Terminal {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl Drop for Terminal {
     fn drop(&mut self) {
         unsafe {
@@ -111,11 +167,90 @@ impl Drop for Terminal {
     }
 }
 
-// Global flag for signals
-static mut QUIT: bool = false;
+#[cfg(target_os = "windows")]
+struct Terminal {
+    stdin_handle: HANDLE,
+    stdout_handle: HANDLE,
+    original_stdin_mode: u32,
+    original_stdout_mode: u32,
+}
 
+#[cfg(target_os = "windows")]
+impl Terminal {
+    fn init() -> io::Result<Self> {
+        unsafe {
+            let stdin_handle = GetStdHandle(STD_INPUT_HANDLE);
+            let stdout_handle = GetStdHandle(STD_OUTPUT_HANDLE);
+            if stdin_handle.is_null() || stdin_handle == INVALID_HANDLE_VALUE
+                || stdout_handle.is_null() || stdout_handle == INVALID_HANDLE_VALUE {
+                return Err(io::Error::last_os_error());
+            }
+
+            let mut original_stdin_mode: u32 = 0;
+            let mut original_stdout_mode: u32 = 0;
+            if GetConsoleMode(stdin_handle, &mut original_stdin_mode) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if GetConsoleMode(stdout_handle, &mut original_stdout_mode) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+
+            // Enable VT processing on stdout
+            let new_stdout_mode = original_stdout_mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING | ENABLE_PROCESSED_OUTPUT;
+            if SetConsoleMode(stdout_handle, new_stdout_mode) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+
+            // Disable line input, echo, processed input on stdin; enable window input + VT input for resize/seq events
+            let new_stdin_mode = (original_stdin_mode & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT)) | ENABLE_WINDOW_INPUT | ENABLE_VIRTUAL_TERMINAL_INPUT;
+            if SetConsoleMode(stdin_handle, new_stdin_mode) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+
+            print!("\x1B[?1049h\x1B[?7l\x1B[2J\x1B[H\x1B[?25l");
+            io::stdout().flush()?;
+
+            Ok(Self { stdin_handle, stdout_handle, original_stdin_mode, original_stdout_mode })
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for Terminal {
+    fn drop(&mut self) {
+        unsafe {
+            SetConsoleMode(self.stdin_handle, self.original_stdin_mode);
+            SetConsoleMode(self.stdout_handle, self.original_stdout_mode);
+        }
+        print!("\x1B[?7h\x1B[?1049l\x1B[?25h\x1B[0m");
+        let _ = io::stdout().flush();
+    }
+}
+
+// Global flag for signals
+static QUIT: AtomicBool = AtomicBool::new(false);
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 extern "C" fn signal_handler(_sig: libc::c_int) {
-    unsafe { QUIT = true; }
+    QUIT.store(true, AtomicOrdering::SeqCst);
+}
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn ctrl_handler(_ctrl_type: u32) -> BOOL {
+    QUIT.store(true, AtomicOrdering::SeqCst);
+    TRUE
+}
+
+// Number of active logical processors across all processor groups.
+// GetSystemInfo().dwNumberOfProcessors only reports the current group (max 64),
+// so it undercounts on >64-core, multi-group hosts.
+#[cfg(target_os = "windows")]
+const ALL_PROCESSOR_GROUPS: u16 = 0xffff;
+
+#[cfg(target_os = "windows")]
+fn active_cpu_count() -> u32 {
+    let n = unsafe { GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) };
+    if n == 0 { 1 } else { n }
 }
 
 #[cfg(target_os = "linux")]
@@ -141,7 +276,7 @@ struct Sampler {
     procs: Vec<ProcessInfo>,
     cpu_temp_path: Option<String>,
     cpu_freq_paths: Vec<String>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     logical_cpus: u64,
     #[cfg(target_os = "macos")]
     proc_names: HashMap<i32, String>,
@@ -164,8 +299,13 @@ impl Sampler {
             procs: Vec::new(),
             cpu_temp_path: None,
             cpu_freq_paths: Vec::new(),
-            #[cfg(target_os = "macos")]
-            logical_cpus: read_logical_cpu_count(),
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            logical_cpus: {
+                #[cfg(target_os = "macos")]
+                { read_logical_cpu_count() }
+                #[cfg(target_os = "windows")]
+                { active_cpu_count() as u64 }
+            },
             #[cfg(target_os = "macos")]
             proc_names: HashMap::new(),
         }
@@ -424,6 +564,52 @@ fn read_cpu_temp(_cached_path: &mut Option<String>) -> f64 {
     -1000.0
 }
 
+#[cfg(target_os = "windows")]
+fn win_reg_read_string(subkey: &[u16], value_name: &[u16]) -> Option<String> {
+    unsafe {
+        let mut hkey: windows_sys::Win32::System::Registry::HKEY = std::ptr::null_mut();
+        if RegOpenKeyExW(HKEY_LOCAL_MACHINE, subkey.as_ptr(), 0, KEY_READ, &mut hkey) != 0 {
+            return None;
+        }
+        let mut buf = [0u16; 512];
+        let mut buf_len = (buf.len() * 2) as u32;
+        let mut reg_type: u32 = 0;
+        let result = RegQueryValueExW(
+            hkey, value_name.as_ptr(), std::ptr::null(),
+            &mut reg_type, buf.as_mut_ptr() as *mut u8, &mut buf_len,
+        );
+        RegCloseKey(hkey);
+        if result != 0 || reg_type != REG_SZ { return None; }
+        let chars = buf_len as usize / 2;
+        let s = String::from_utf16_lossy(&buf[..chars]);
+        Some(s.trim_end_matches('\0').to_string())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn win_wstr(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(target_os = "windows")]
+fn read_cpu_temp(_cached_path: &mut Option<String>) -> f64 {
+    // Try wmic for CPU temperature
+    if let Ok(output) = std::process::Command::new("wmic")
+        .args(["path", "MSAcpi_ThermalZoneTemperature", "get", "CurrentTemperature", "/value"])
+        .output()
+        && output.status.success() {
+            let out_str = String::from_utf8_lossy(&output.stdout);
+            for line in out_str.lines() {
+                if let Some(val) = line.strip_prefix("CurrentTemperature=") {
+                    if let Ok(t) = val.trim().parse::<f64>() {
+                        return (t - 2732.0) / 10.0;
+                    }
+                }
+            }
+        }
+    -1000.0
+}
+
 #[cfg(target_os = "linux")]
 fn read_cpu_freq(cached_paths: &mut Vec<String>) -> f64 {
     // Discover sysfs freq paths once and cache them
@@ -478,6 +664,31 @@ fn read_cpu_freq(_cached_paths: &mut Vec<String>) -> f64 {
         .or_else(|| sysctl_u64("hw.cpufrequency_max"))
         .map(|hz| hz as f64 / 1_000_000.0)
         .unwrap_or(0.0)
+}
+
+#[cfg(target_os = "windows")]
+fn read_cpu_freq(_cached_paths: &mut Vec<String>) -> f64 {
+    unsafe {
+        let count = active_cpu_count() as usize;
+        if count == 0 { return 0.0; }
+
+        let mut pinfo: Vec<PROCESSOR_POWER_INFORMATION> = vec![std::mem::zeroed(); count];
+        let ret = CallNtPowerInformation(
+            ProcessorInformation, std::ptr::null(), 0,
+            pinfo.as_mut_ptr() as *mut core::ffi::c_void,
+            (count * std::mem::size_of::<PROCESSOR_POWER_INFORMATION>()) as u32,
+        );
+        if ret != 0 { return 0.0; }
+
+        // MhzLimit includes turbo headroom; CurrentMhz is the actual frequency.
+        // Pick the highest across all processors.
+        let mut best = pinfo[0].MaxMhz;
+        for p in &pinfo {
+            if p.CurrentMhz > best { best = p.CurrentMhz; }
+            if p.MhzLimit > best { best = p.MhzLimit; }
+        }
+        best as f64
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -579,6 +790,22 @@ fn read_gpu_cores() -> String {
     String::new()
 }
 
+#[cfg(target_os = "windows")]
+fn read_gpu_cores() -> String {
+    if let Ok(output) = std::process::Command::new("nvidia-smi")
+        .arg("-L")
+        .output()
+        && output.status.success() {
+            let out_str = String::from_utf8_lossy(&output.stdout);
+            let gpu_count = out_str.lines().filter(|l| l.starts_with("GPU")).count();
+            if gpu_count > 0 {
+                let gpu_str = if gpu_count == 1 { "GPU:" } else { "GPUs:" };
+                return format!("{} {}", gpu_str, gpu_count);
+            }
+        }
+    String::new()
+}
+
 #[cfg(target_os = "linux")]
 fn read_cpu_name() -> String {
     if let Ok(content) = fs::read_to_string("/proc/cpuinfo") {
@@ -604,6 +831,22 @@ fn read_cpu_name() -> String {
     sysctl_string("machdep.cpu.brand_string")
         .or_else(|| sysctl_string("hw.model"))
         .unwrap_or_else(|| "CPU".to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn read_cpu_name() -> String {
+    let subkey = win_wstr("HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0");
+    let value_name = win_wstr("ProcessorNameString");
+    if let Some(name) = win_reg_read_string(&subkey, &value_name) {
+        let mut n = name.replace("(R)", "").replace("(TM)", "").replace("(tm)", "").replace("(r)", "");
+        n = n.replace(" CPU", "").replace(" Processor", "");
+        let parts: Vec<&str> = n.split_whitespace().collect();
+        n = parts.join(" ");
+        n = n.replace("Intel Core ", "");
+        n = n.replace("AMD Ryzen ", "Ryzen ");
+        return n;
+    }
+    "CPU".to_string()
 }
 
 #[cfg(target_os = "linux")]
@@ -643,6 +886,26 @@ fn read_cpu_times() -> CpuTimes {
             t.sys = info.cpu_ticks[libc::CPU_STATE_SYSTEM as usize] as u64;
             t.idle = info.cpu_ticks[libc::CPU_STATE_IDLE as usize] as u64;
             t.nice = info.cpu_ticks[libc::CPU_STATE_NICE as usize] as u64;
+        }
+    }
+    t
+}
+
+#[cfg(target_os = "windows")]
+fn read_cpu_times() -> CpuTimes {
+    let mut t = CpuTimes::default();
+    unsafe {
+        let mut idle_time: FILETIME = std::mem::zeroed();
+        let mut kernel_time: FILETIME = std::mem::zeroed();
+        let mut user_time: FILETIME = std::mem::zeroed();
+        if GetSystemTimes(&mut idle_time, &mut kernel_time, &mut user_time) != 0 {
+            let idle = ((idle_time.dwHighDateTime as u64) << 32) | idle_time.dwLowDateTime as u64;
+            let kernel = ((kernel_time.dwHighDateTime as u64) << 32) | kernel_time.dwLowDateTime as u64;
+            let user = ((user_time.dwHighDateTime as u64) << 32) | user_time.dwLowDateTime as u64;
+            // kernel includes idle time on Windows
+            t.sys = kernel.saturating_sub(idle);
+            t.user = user;
+            t.idle = idle;
         }
     }
     t
@@ -717,6 +980,51 @@ fn read_memory() -> MemorySnapshot {
     m
 }
 
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn enum_pf_callback(
+    pcontext: *mut core::ffi::c_void,
+    ppagefileinfo: *mut ENUM_PAGE_FILE_INFORMATION,
+    _lpfilename: windows_sys::core::PCWSTR,
+) -> BOOL {
+    unsafe {
+        let info = &*ppagefileinfo;
+        let out = &mut *(pcontext as *mut (u64, u64));
+        // Called once per pagefile; accumulate so multiple pagefiles are summed.
+        out.0 += info.TotalInUse as u64;
+        out.1 += info.TotalSize as u64;
+    }
+    1
+}
+
+#[cfg(target_os = "windows")]
+fn read_memory() -> MemorySnapshot {
+    let mut m = MemorySnapshot::default();
+    unsafe {
+        let mut si: SYSTEM_INFO = std::mem::zeroed();
+        GetSystemInfo(&mut si);
+        let page_size = si.dwPageSize as u64;
+
+        let mut pi: PERFORMANCE_INFORMATION = std::mem::zeroed();
+        pi.cb = std::mem::size_of::<PERFORMANCE_INFORMATION>() as u32;
+        let cb = pi.cb;
+        if GetPerformanceInfo(&mut pi, cb) != 0 {
+            m.total_bytes = (pi.PhysicalTotal as u64) * page_size;
+            m.used_bytes = (pi.PhysicalTotal.saturating_sub(pi.PhysicalAvailable) as u64) * page_size;
+        }
+
+        let mut pf_info: (u64, u64) = (0, 0);
+        K32EnumPageFilesW(
+            Some(enum_pf_callback),
+            &mut pf_info as *mut _ as *mut core::ffi::c_void,
+        );
+        if pf_info.1 > 0 {
+            m.swap_total_bytes = pf_info.1 * page_size;
+            m.swap_used_bytes = std::cmp::min(pf_info.0 * page_size, pf_info.1 * page_size);
+        }
+    }
+    m
+}
+
 #[cfg(target_os = "linux")]
 fn read_cpu_count() -> String {
     let mut cores = 0;
@@ -771,6 +1079,16 @@ fn read_logical_cpu_count() -> u64 {
         .filter(|v| *v > 0)
         .map(|v| v as u64)
         .unwrap_or(1)
+}
+
+#[cfg(target_os = "windows")]
+fn read_cpu_count() -> String {
+    {
+        let cores = active_cpu_count();
+        let cpu_str = if cores == 1 { "CPU:" } else { "CPUs:" };
+        let core_str = if cores == 1 { "core" } else { "cores" };
+        format!("{} {}, {} {}", cpu_str, 1, cores, core_str)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1021,6 +1339,48 @@ fn read_gpu(
     g
 }
 
+#[cfg(target_os = "windows")]
+fn read_gpu(
+    _s: &mut Sampler,
+    _mem: &MemorySnapshot,
+    cached_gpu: &mut GpuSnapshot,
+    last_gpu_read: &mut Instant,
+) -> GpuSnapshot {
+    let now = Instant::now();
+    if now.duration_since(*last_gpu_read) < Duration::from_millis(800) {
+        return cached_gpu.clone();
+    }
+    *last_gpu_read = now;
+
+    // Try nvidia-smi
+    if let Ok(output) = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu", "--format=csv,noheader,nounits"])
+        .output()
+        && output.status.success()
+    {
+        let out_str = String::from_utf8_lossy(&output.stdout);
+        if let Some(line) = out_str.lines().next() {
+            let parts: Vec<&str> = line.split(',').map(|p| p.trim()).collect();
+            if parts.len() >= 5 {
+                let mut g = GpuSnapshot::default();
+                g.name = parts[0].to_string().replace("NVIDIA GeForce ", "").replace("NVIDIA ", "");
+                g.usage = parts[1].parse().unwrap_or(0.0);
+                g.has_usage = true;
+                g.mem_used = parts[2].parse::<u64>().unwrap_or(0) * 1024 * 1024;
+                g.has_mem = true;
+                g.mem_total = parts[3].parse::<u64>().unwrap_or(0) * 1024 * 1024;
+                g.temp = parts[4].parse().unwrap_or(-1000.0);
+                g.has_temp = true;
+                *cached_gpu = g.clone();
+                return g;
+            }
+        }
+    }
+
+    *cached_gpu = GpuSnapshot::default();
+    cached_gpu.clone()
+}
+
 #[cfg(target_os = "linux")]
 fn read_network(prev_net: &mut HashMap<String, (u64, u64)>, elapsed: f64) -> NetworkSnapshot {
     let mut best = NetworkSnapshot { iface: "-".to_string(), rx_rate: 0.0, tx_rate: 0.0 };
@@ -1095,6 +1455,39 @@ fn read_network(prev_net: &mut HashMap<String, (u64, u64)>, elapsed: f64) -> Net
         libc::freeifaddrs(addrs);
     }
 
+    *prev_net = cur_net;
+    best
+}
+
+#[cfg(target_os = "windows")]
+fn read_network(prev_net: &mut HashMap<String, (u64, u64)>, elapsed: f64) -> NetworkSnapshot {
+    let mut best = NetworkSnapshot { iface: "-".to_string(), rx_rate: 0.0, tx_rate: 0.0 };
+    let mut cur_net: HashMap<String, (u64, u64)> = HashMap::new();
+    unsafe {
+        let mut table: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
+        if GetIfTable2(&mut table) != 0 {
+            return best;
+        }
+        let entries = (*table).NumEntries as usize;
+        let rows = std::slice::from_raw_parts((*table).Table.as_ptr(), entries);
+        let mut best_total = 0_u64;
+        for row in rows {
+            let name = String::from_utf16_lossy(&row.Description).trim_end_matches('\0').to_string();
+            let rx = row.InOctets;
+            let tx = row.OutOctets;
+            let (prev_rx, prev_tx) = prev_net.get(&name).copied().unwrap_or((rx, tx));
+            let rx_r = if rx >= prev_rx { (rx - prev_rx) as f64 / elapsed } else { 0.0 };
+            let tx_r = if tx >= prev_tx { (tx - prev_tx) as f64 / elapsed } else { 0.0 };
+            if rx + tx > best_total {
+                best_total = rx + tx;
+                best.iface = name.clone();
+                best.rx_rate = rx_r;
+                best.tx_rate = tx_r;
+            }
+            cur_net.insert(name, (rx, tx));
+        }
+        FreeMibTable(table as *mut _);
+    }
     *prev_net = cur_net;
     best
 }
@@ -1196,6 +1589,40 @@ fn read_storage() -> Vec<StorageSnapshot> {
     snapshots
 }
 
+#[cfg(target_os = "windows")]
+fn read_storage() -> Vec<StorageSnapshot> {
+    let mut snapshots = Vec::new();
+    unsafe {
+        let mut buf = [0u16; 512];
+        if GetLogicalDriveStringsW(buf.len() as u32, buf.as_mut_ptr()) == 0 {
+            return snapshots;
+        }
+        let mut i = 0;
+        while i < buf.len() && buf[i] != 0 {
+            let end = i + buf[i..].iter().position(|&c| c == 0).unwrap_or(buf.len() - i);
+            let root = String::from_utf16_lossy(&buf[i..end]);
+            i = end + 1;
+            let root_w = root.encode_utf16().chain(std::iter::once(0)).collect::<Vec<_>>();
+            let mut free_bytes: u64 = 0;
+            let mut total_bytes: u64 = 0;
+            let mut total_free: u64 = 0;
+            if GetDiskFreeSpaceExW(root_w.as_ptr(), &mut free_bytes, &mut total_bytes, &mut total_free) != 0 && total_bytes > 0 {
+                let used = total_bytes.saturating_sub(free_bytes);
+                let device = root.trim_end_matches('\\').to_string();
+                snapshots.push(StorageSnapshot {
+                    mount_point: root,
+                    device,
+                    used_bytes: used,
+                    total_bytes,
+                });
+            }
+        }
+    }
+    snapshots.sort_by(|a, b| b.total_bytes.cmp(&a.total_bytes));
+    snapshots
+}
+
+#[cfg_attr(target_os = "windows", allow(unused_variables))]
 fn sample(
     s: &mut Sampler, sort: SortMode, filter: &str,
     out_cpu: &mut f64, out_mem: &mut MemorySnapshot, out_net: &mut NetworkSnapshot,
@@ -1220,7 +1647,9 @@ fn sample(
     *out_cpus = s.cpu_count.clone();
 
     s.procs.clear();
+    #[allow(unused_mut)]
     let mut new_ticks: HashMap<i32, u64> = HashMap::with_capacity(s.prev_ticks.len());
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let filter_lower = filter.to_lowercase();
 
     #[cfg(target_os = "linux")]
@@ -1365,6 +1794,70 @@ fn sample(
         }
     }
 
+    #[cfg(target_os = "windows")]
+    {
+        let filter_lower = filter.to_lowercase();
+        let logical_cpus = s.logical_cpus.max(1);
+        let proc_cpu_denominator = elapsed * logical_cpus as f64 * 10_000_000.0;
+        unsafe {
+            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if snapshot != INVALID_HANDLE_VALUE {
+                let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+                entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+                let mut ok = Process32FirstW(snapshot, &mut entry) != 0;
+                while ok {
+                    let pid = entry.th32ProcessID as i32;
+                    let name = String::from_utf16_lossy(&entry.szExeFile).trim_end_matches('\0').to_string();
+                    let threads = entry.cntThreads as i32;
+
+                    if !filter.is_empty() {
+                        let pid_str = pid.to_string();
+                        if !name.to_lowercase().contains(&filter_lower) && !pid_str.contains(&filter_lower) {
+                            ok = Process32NextW(snapshot, &mut entry) != 0;
+                            continue;
+                        }
+                    }
+
+                    let handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid as u32);
+                    if !handle.is_null() {
+                        let mut create_time: FILETIME = std::mem::zeroed();
+                        let mut exit_time: FILETIME = std::mem::zeroed();
+                        let mut kernel_time: FILETIME = std::mem::zeroed();
+                        let mut user_time: FILETIME = std::mem::zeroed();
+                        let mut mem_bytes = 0u64;
+                        if GetProcessTimes(handle, &mut create_time, &mut exit_time, &mut kernel_time, &mut user_time) != 0 {
+                            let kt = ((kernel_time.dwHighDateTime as u64) << 32) | kernel_time.dwLowDateTime as u64;
+                            let ut = ((user_time.dwHighDateTime as u64) << 32) | user_time.dwLowDateTime as u64;
+                            let total_ticks = kt + ut;
+                            let prev_t = s.prev_ticks.get(&pid).copied().unwrap_or(total_ticks);
+                            new_ticks.insert(pid, total_ticks);
+                            let cpu_p = if proc_cpu_denominator > 0.0 {
+                                total_ticks.saturating_sub(prev_t) as f64 * 100.0 / proc_cpu_denominator
+                            } else { 0.0 };
+
+                            let mut pmc: windows_sys::Win32::System::ProcessStatus::PROCESS_MEMORY_COUNTERS = std::mem::zeroed();
+                            pmc.cb = std::mem::size_of::<windows_sys::Win32::System::ProcessStatus::PROCESS_MEMORY_COUNTERS>() as u32;
+                            if K32GetProcessMemoryInfo(handle, &mut pmc, pmc.cb) != 0 {
+                                mem_bytes = pmc.WorkingSetSize as u64;
+                            }
+
+                            s.procs.push(ProcessInfo {
+                                pid,
+                                name,
+                                cpu_percent: cpu_p,
+                                mem_bytes,
+                                threads,
+                            });
+                        }
+                        CloseHandle(handle);
+                    }
+                    ok = Process32NextW(snapshot, &mut entry) != 0;
+                }
+                CloseHandle(snapshot);
+            }
+        }
+    }
+
     s.prev_ticks = new_ticks;
     s.prev_cpu = cur_cpu;
 
@@ -1383,6 +1876,7 @@ enum KeyType {
     None, Quit, Up, Down, Left, Right, Backspace, Enter, Esc, Char(char),
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn read_key() -> KeyType {
     let mut buf = [0u8; 16];
     let n = unsafe { libc::read(libc::STDIN_FILENO, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
@@ -1405,10 +1899,52 @@ fn read_key() -> KeyType {
     KeyType::None
 }
 
+#[cfg(target_os = "windows")]
+fn read_key() -> KeyType {
+    let mut num_events: u32 = 0;
+    unsafe {
+        let h = GetStdHandle(STD_INPUT_HANDLE);
+        // Non-blocking: return None immediately if no events pending
+        if GetNumberOfConsoleInputEvents(h, &mut num_events) == 0 || num_events == 0 {
+            return KeyType::None;
+        }
+        let mut record: INPUT_RECORD = std::mem::zeroed();
+        let mut events_read: u32 = 0;
+        if ReadConsoleInputW(h, &mut record, 1, &mut events_read) == 0 || events_read == 0 {
+            return KeyType::None;
+        }
+        if record.EventType != 1 /* KEY_EVENT */ { return KeyType::None; }
+        let ke: KEY_EVENT_RECORD = record.Event.KeyEvent;
+        if ke.bKeyDown == 0 { return KeyType::None; }
+        let ch = ke.uChar.UnicodeChar;
+        if ch != 0 {
+            let byte = ch as u8;
+            if byte == 3 { return KeyType::Quit; }
+            if byte == 27 { return KeyType::Esc; }
+            if byte == 127 || byte == 8 { return KeyType::Backspace; }
+            if byte == 10 || byte == 13 { return KeyType::Enter; }
+            if byte.is_ascii_graphic() || byte == b' ' { return KeyType::Char(byte as char); }
+            return KeyType::None;
+        }
+        match ke.wVirtualKeyCode {
+            0x26 /* VK_UP */ => KeyType::Up,
+            0x28 /* VK_DOWN */ => KeyType::Down,
+            0x25 /* VK_LEFT */ => KeyType::Left,
+            0x27 /* VK_RIGHT */ => KeyType::Right,
+            _ => KeyType::None,
+        }
+    }
+}
+
 fn main() {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     unsafe {
         libc::signal(libc::SIGINT, signal_handler as *const () as libc::sighandler_t);
         libc::signal(libc::SIGTERM, signal_handler as *const () as libc::sighandler_t);
+    }
+    #[cfg(target_os = "windows")]
+    unsafe {
+        SetConsoleCtrlHandler(Some(ctrl_handler), TRUE);
     }
 
     let _terminal = Terminal::init().ok();
@@ -1439,7 +1975,7 @@ fn main() {
     let mut cpu_freq = 0.0;
 
     loop {
-        unsafe { if QUIT { break; } }
+        if QUIT.load(AtomicOrdering::SeqCst) { break; }
         let now = Instant::now();
 
         if now.duration_since(last_sample) >= Duration::from_millis(500) || needs_sample {
@@ -1452,11 +1988,26 @@ fn main() {
         }
 
         if needs_render && now.duration_since(last_render) >= Duration::from_millis(16) {
-            let mut ws = unsafe { std::mem::zeroed::<libc::winsize>() };
-            unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws); }
-            
-            let term_height = if ws.ws_row == 0 { 24 } else { ws.ws_row };
-            let term_width = if ws.ws_col == 0 { 80 } else { ws.ws_col as usize };
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            let (term_height, term_width) = {
+                let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+                unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws); }
+                let h = if ws.ws_row == 0 { 24 } else { ws.ws_row };
+                let w = if ws.ws_col == 0 { 80 } else { ws.ws_col as usize };
+                (h, w)
+            };
+            #[cfg(target_os = "windows")]
+            let (term_height, term_width) = {
+                let mut csbi: CONSOLE_SCREEN_BUFFER_INFO = unsafe { std::mem::zeroed() };
+                let h = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+                if unsafe { GetConsoleScreenBufferInfo(h, &mut csbi) } != 0 {
+                    let w = (csbi.srWindow.Right - csbi.srWindow.Left + 1) as usize;
+                    let h = (csbi.srWindow.Bottom - csbi.srWindow.Top + 1) as u16;
+                    (h, w)
+                } else {
+                    (24u16, 80usize)
+                }
+            };
             let mut row = 1_u16;
 
             let _ = write!(out, "\x1B[H");
@@ -1572,8 +2123,15 @@ fn main() {
             needs_render = false;
         }
 
-        let mut pfd = libc::pollfd { fd: libc::STDIN_FILENO, events: libc::POLLIN, revents: 0 };
-        if unsafe { libc::poll(&mut pfd, 1, 10) } > 0 {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let has_input = {
+            let mut pfd = libc::pollfd { fd: libc::STDIN_FILENO, events: libc::POLLIN, revents: 0 };
+            (unsafe { libc::poll(&mut pfd, 1, 10) }) > 0
+        };
+        #[cfg(target_os = "windows")]
+        let has_input = unsafe { WaitForSingleObject(GetStdHandle(STD_INPUT_HANDLE), 10) == 0 };
+
+        if has_input {
             loop {
                 let k = read_key();
                 match k {
@@ -1717,5 +2275,101 @@ mod tests {
 
         #[cfg(target_os = "macos")]
         assert!(!storage.is_empty());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_read_memory_windows() {
+        let mem = read_memory();
+        assert!(mem.total_bytes > 0, "total memory should be > 0");
+        assert!(mem.total_bytes >= mem.used_bytes, "total >= used");
+        assert!(mem.total_bytes >= 128 * 1024 * 1024, "total memory >= 128 MiB");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_read_swap_windows() {
+        // A pagefile may legitimately be disabled, so swap_total_bytes can be 0.
+        // Only assert the invariant that used never exceeds total.
+        let mem = read_memory();
+        assert!(mem.swap_used_bytes <= mem.swap_total_bytes, "swap used ({}) <= total ({})", mem.swap_used_bytes, mem.swap_total_bytes);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_read_cpu_count_windows() {
+        let cpus = read_cpu_count();
+        assert!(!cpus.is_empty(), "CPU count string should not be empty");
+        let cores: u32 = cpus.split_whitespace().nth(2)
+            .and_then(|w| w.trim_end_matches(',').parse().ok())
+            .unwrap_or(0);
+        assert!(cores > 0, "CPU core count should be > 0, got '{cpus}'");
+        assert!(cores <= 256, "CPU core count should be reasonable, got {cores}");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_read_network_windows() {
+        let mut prev = HashMap::new();
+        let elapsed = 1.0;
+        let net = read_network(&mut prev, elapsed);
+        assert!(!net.iface.is_empty(), "network interface should not be empty");
+        assert!(net.rx_rate >= 0.0, "rx rate >= 0");
+        assert!(net.tx_rate >= 0.0, "tx rate >= 0");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_read_storage_windows() {
+        let storage = read_storage();
+        assert!(!storage.is_empty(), "should have at least one storage device");
+        for s in &storage {
+            assert!(!s.device.is_empty(), "device should not be empty");
+            assert!(s.total_bytes > 0, "total bytes > 0 for {}", s.mount_point);
+            assert!(s.used_bytes <= s.total_bytes, "used <= total for {}", s.mount_point);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_read_cpu_freq_windows() {
+        let freq = read_cpu_freq(&mut Vec::new());
+        eprintln!("debug: read_cpu_freq returned {freq} MHz");
+        assert!(freq > 0.0, "CPU frequency should be > 0, got {freq}");
+        assert!(freq < 100_000.0, "CPU frequency unrealistic, got {freq}");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_sample_windows() {
+        let mut sampler = Sampler::new();
+        let mut cpu = 0.0;
+        let mut mem = MemorySnapshot::default();
+        let mut net = NetworkSnapshot::default();
+        let mut gpu = GpuSnapshot::default();
+        let mut storage = Vec::new();
+        let mut cpus = String::new();
+        let mut cached_gpu = GpuSnapshot::default();
+        let mut last_gpu_read = Instant::now().checked_sub(Duration::from_secs(10)).unwrap();
+
+        sample(
+            &mut sampler,
+            SortMode::Cpu,
+            "",
+            &mut cpu,
+            &mut mem,
+            &mut net,
+            &mut gpu,
+            &mut storage,
+            &mut cpus,
+            &mut cached_gpu,
+            &mut last_gpu_read,
+        );
+
+        assert!(cpu >= 0.0);
+        assert!(mem.total_bytes > 0);
+        assert!(!sampler.procs.is_empty(), "should have at least one process");
+        assert!(!cpus.is_empty(), "CPU count should be populated");
+        assert!(!storage.is_empty(), "should have at least one storage device");
     }
 }

@@ -8,17 +8,32 @@ on:
 
 jobs:
   build:
-    name: Build on Linux
-    runs-on: ubuntu-latest
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: utop-linux
+            binary: target/release/utop
+          - os: macos-latest
+            artifact: utop-macos
+            binary: target/release/utop
+          - os: windows-latest
+            artifact: utop-windows
+            binary: target/release/utop.exe
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      with:
+        persist-credentials: false
 
     - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
     - name: Cache cargo registry
-      uses: actions/cache@v4
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
       with:
         path: |
           ~/.cargo/registry
@@ -32,14 +47,21 @@ jobs:
     - name: Run tests
       run: cargo test
 
-    - name: Check binary exists
+    - name: Check binary exists (Unix)
+      if: runner.os != 'Windows'
       run: |
-        test -x ./target/release/utop
-        file ./target/release/utop
+        test -x ${{ matrix.binary }}
+        file ${{ matrix.binary }}
+
+    - name: Check binary exists (Windows)
+      if: runner.os == 'Windows'
+      run: |
+        if (!(Test-Path "${{ matrix.binary }}")) { throw "Binary not found" }
+        Get-Item "${{ matrix.binary }}"
 
     - name: Upload Artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
       with:
-        name: utop-linux
-        path: target/release/utop
+        name: ${{ matrix.artifact }}
+        path: ${{ matrix.binary }}
         retention-days: 14
