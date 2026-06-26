@@ -10,6 +10,7 @@ use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 #[cfg(target_os = "linux")]
 use std::io::Read;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "windows")]
@@ -27,7 +28,7 @@ use windows_sys::Win32::System::Console::{
 };
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::System::Threading::{
-    GetSystemTimes, OpenProcess, GetProcessTimes,
+    GetSystemTimes, OpenProcess, GetProcessTimes, GetActiveProcessorCount,
     PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
 };
 #[cfg(target_os = "windows")]
@@ -180,22 +181,31 @@ impl Terminal {
         unsafe {
             let stdin_handle = GetStdHandle(STD_INPUT_HANDLE);
             let stdout_handle = GetStdHandle(STD_OUTPUT_HANDLE);
-            if stdin_handle == INVALID_HANDLE_VALUE || stdout_handle == INVALID_HANDLE_VALUE {
+            if stdin_handle.is_null() || stdin_handle == INVALID_HANDLE_VALUE
+                || stdout_handle.is_null() || stdout_handle == INVALID_HANDLE_VALUE {
                 return Err(io::Error::last_os_error());
             }
 
             let mut original_stdin_mode: u32 = 0;
             let mut original_stdout_mode: u32 = 0;
-            GetConsoleMode(stdin_handle, &mut original_stdin_mode);
-            GetConsoleMode(stdout_handle, &mut original_stdout_mode);
+            if GetConsoleMode(stdin_handle, &mut original_stdin_mode) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if GetConsoleMode(stdout_handle, &mut original_stdout_mode) == 0 {
+                return Err(io::Error::last_os_error());
+            }
 
             // Enable VT processing on stdout
             let new_stdout_mode = original_stdout_mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING | ENABLE_PROCESSED_OUTPUT;
-            SetConsoleMode(stdout_handle, new_stdout_mode);
+            if SetConsoleMode(stdout_handle, new_stdout_mode) == 0 {
+                return Err(io::Error::last_os_error());
+            }
 
             // Disable line input, echo, processed input on stdin; enable window input + VT input for resize/seq events
             let new_stdin_mode = (original_stdin_mode & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT)) | ENABLE_WINDOW_INPUT | ENABLE_VIRTUAL_TERMINAL_INPUT;
-            SetConsoleMode(stdin_handle, new_stdin_mode);
+            if SetConsoleMode(stdin_handle, new_stdin_mode) == 0 {
+                return Err(io::Error::last_os_error());
+            }
 
             print!("\x1B[?1049h\x1B[?7l\x1B[2J\x1B[H\x1B[?25l");
             io::stdout().flush()?;
@@ -218,17 +228,29 @@ impl Drop for Terminal {
 }
 
 // Global flag for signals
-static mut QUIT: bool = false;
+static QUIT: AtomicBool = AtomicBool::new(false);
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 extern "C" fn signal_handler(_sig: libc::c_int) {
-    unsafe { QUIT = true; }
+    QUIT.store(true, AtomicOrdering::SeqCst);
 }
 
 #[cfg(target_os = "windows")]
 unsafe extern "system" fn ctrl_handler(_ctrl_type: u32) -> BOOL {
-    unsafe { QUIT = true; }
+    QUIT.store(true, AtomicOrdering::SeqCst);
     TRUE
+}
+
+// Number of active logical processors across all processor groups.
+// GetSystemInfo().dwNumberOfProcessors only reports the current group (max 64),
+// so it undercounts on >64-core, multi-group hosts.
+#[cfg(target_os = "windows")]
+const ALL_PROCESSOR_GROUPS: u16 = 0xffff;
+
+#[cfg(target_os = "windows")]
+fn active_cpu_count() -> u32 {
+    let n = unsafe { GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) };
+    if n == 0 { 1 } else { n }
 }
 
 #[cfg(target_os = "linux")]
@@ -282,11 +304,7 @@ impl Sampler {
                 #[cfg(target_os = "macos")]
                 { read_logical_cpu_count() }
                 #[cfg(target_os = "windows")]
-                {
-                    let mut info: SYSTEM_INFO = unsafe { std::mem::zeroed() };
-                    unsafe { GetSystemInfo(&mut info); }
-                    info.dwNumberOfProcessors as u64
-                }
+                { active_cpu_count() as u64 }
             },
             #[cfg(target_os = "macos")]
             proc_names: HashMap::new(),
@@ -562,9 +580,7 @@ fn read_cpu_freq(_cached_paths: &mut Vec<String>) -> f64 {
 #[cfg(target_os = "windows")]
 fn read_cpu_freq(_cached_paths: &mut Vec<String>) -> f64 {
     unsafe {
-        let mut si: SYSTEM_INFO = std::mem::zeroed();
-        GetSystemInfo(&mut si);
-        let count = si.dwNumberOfProcessors as usize;
+        let count = active_cpu_count() as usize;
         if count == 0 { return 0.0; }
 
         let mut pinfo: Vec<PROCESSOR_POWER_INFORMATION> = vec![std::mem::zeroed(); count];
@@ -884,7 +900,9 @@ unsafe extern "system" fn enum_pf_callback(
     unsafe {
         let info = &*ppagefileinfo;
         let out = &mut *(pcontext as *mut (u64, u64));
-        *out = (info.TotalInUse as u64, info.TotalSize as u64);
+        // Called once per pagefile; accumulate so multiple pagefiles are summed.
+        out.0 += info.TotalInUse as u64;
+        out.1 += info.TotalSize as u64;
     }
     1
 }
@@ -899,7 +917,8 @@ fn read_memory() -> MemorySnapshot {
 
         let mut pi: PERFORMANCE_INFORMATION = std::mem::zeroed();
         pi.cb = std::mem::size_of::<PERFORMANCE_INFORMATION>() as u32;
-        if GetPerformanceInfo(&mut pi, pi.cb) != 0 {
+        let cb = pi.cb;
+        if GetPerformanceInfo(&mut pi, cb) != 0 {
             m.total_bytes = (pi.PhysicalTotal as u64) * page_size;
             m.used_bytes = (pi.PhysicalTotal.saturating_sub(pi.PhysicalAvailable) as u64) * page_size;
         }
@@ -975,10 +994,8 @@ fn read_logical_cpu_count() -> u64 {
 
 #[cfg(target_os = "windows")]
 fn read_cpu_count() -> String {
-    unsafe {
-        let mut info: SYSTEM_INFO = std::mem::zeroed();
-        GetSystemInfo(&mut info);
-        let cores = info.dwNumberOfProcessors;
+    {
+        let cores = active_cpu_count();
         let cpu_str = if cores == 1 { "CPU:" } else { "CPUs:" };
         let core_str = if cores == 1 { "core" } else { "cores" };
         format!("{} {}, {} {}", cpu_str, 1, cores, core_str)
@@ -1488,7 +1505,7 @@ fn read_storage() -> Vec<StorageSnapshot> {
     let mut snapshots = Vec::new();
     unsafe {
         let mut buf = [0u16; 512];
-        if GetLogicalDriveStringsW((buf.len() / 2) as u32, buf.as_mut_ptr()) == 0 {
+        if GetLogicalDriveStringsW(buf.len() as u32, buf.as_mut_ptr()) == 0 {
             return snapshots;
         }
         let mut i = 0;
@@ -1868,7 +1885,7 @@ fn main() {
     let mut cpu_freq = 0.0;
 
     loop {
-        unsafe { if QUIT { break; } }
+        if QUIT.load(AtomicOrdering::SeqCst) { break; }
         let now = Instant::now();
 
         if now.duration_since(last_sample) >= Duration::from_millis(500) || needs_sample {
@@ -2155,8 +2172,9 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn test_read_swap_windows() {
+        // A pagefile may legitimately be disabled, so swap_total_bytes can be 0.
+        // Only assert the invariant that used never exceeds total.
         let mem = read_memory();
-        assert!(mem.swap_total_bytes > 0, "swap total should be > 0, got {}", mem.swap_total_bytes);
         assert!(mem.swap_used_bytes <= mem.swap_total_bytes, "swap used ({}) <= total ({})", mem.swap_used_bytes, mem.swap_total_bytes);
     }
 
