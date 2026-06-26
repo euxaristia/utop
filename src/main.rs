@@ -14,7 +14,8 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "windows")]
-use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE, BOOL, TRUE, FILETIME, CloseHandle};
+use windows_sys::core::BOOL;
+use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE, TRUE, FILETIME, CloseHandle};
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::System::Console::{
     GetConsoleMode, SetConsoleMode, GetStdHandle, GetConsoleScreenBufferInfo,
