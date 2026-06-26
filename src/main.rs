@@ -353,7 +353,24 @@ fn colour_enabled() -> bool {
         return false;
     }
 
+    stdout_is_tty()
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn stdout_is_tty() -> bool {
     unsafe { libc::isatty(libc::STDOUT_FILENO) == 1 }
+}
+
+#[cfg(target_os = "windows")]
+fn stdout_is_tty() -> bool {
+    unsafe {
+        let h = GetStdHandle(STD_OUTPUT_HANDLE);
+        if h.is_null() || h == INVALID_HANDLE_VALUE {
+            return false;
+        }
+        let mut mode: u32 = 0;
+        GetConsoleMode(h, &mut mode) != 0
+    }
 }
 
 fn colour(enabled: bool, style: &'static str) -> &'static str {
@@ -2239,6 +2256,50 @@ mod tests {
         assert!(rendered.contains(STYLE_OK));
         assert!(rendered.contains("abc"));
         assert!(!rendered.contains("abcd"));
+    }
+
+    #[test]
+    fn test_colour_enabled_env_overrides() {
+        // colour_enabled() reads process-global env vars, so run the cases
+        // sequentially in one test and restore the environment afterwards.
+        let keys = ["NO_COLOR", "CLICOLOR_FORCE", "CLICOLOR", "TERM"];
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> =
+            keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        let clear_all = || {
+            for k in keys {
+                unsafe { std::env::remove_var(k); }
+            }
+        };
+
+        // NO_COLOR disables colour, and takes precedence over CLICOLOR_FORCE.
+        clear_all();
+        unsafe { std::env::set_var("NO_COLOR", "1"); }
+        assert!(!colour_enabled());
+        unsafe { std::env::set_var("CLICOLOR_FORCE", "1"); }
+        assert!(!colour_enabled(), "NO_COLOR should take precedence over CLICOLOR_FORCE");
+
+        // CLICOLOR_FORCE forces colour on when NO_COLOR is unset.
+        clear_all();
+        unsafe { std::env::set_var("CLICOLOR_FORCE", "1"); }
+        assert!(colour_enabled());
+
+        // CLICOLOR=0 disables colour.
+        clear_all();
+        unsafe { std::env::set_var("CLICOLOR", "0"); }
+        assert!(!colour_enabled());
+
+        // TERM=dumb disables colour.
+        clear_all();
+        unsafe { std::env::set_var("TERM", "dumb"); }
+        assert!(!colour_enabled());
+
+        // Restore the original environment.
+        clear_all();
+        for (k, v) in saved {
+            if let Some(val) = v {
+                unsafe { std::env::set_var(k, val); }
+            }
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
